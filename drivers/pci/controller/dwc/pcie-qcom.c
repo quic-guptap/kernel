@@ -26,6 +26,7 @@
 #include <linux/pci-ecam.h>
 #include <linux/pci-pwrctrl.h>
 #include <linux/pm_opp.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/platform_device.h>
 #include <linux/phy/pcie.h>
@@ -2051,6 +2052,11 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
 	ret = dw_pcie_suspend_noirq(pcie->pci);
 	if (ret)
 		return ret;
+
+	if (pcie->pci->suspended)
+		dev_pm_genpd_rpm_always_on(dev, false);
+	else
+		dev_pm_genpd_rpm_always_on(dev, true);
 
 	if (pcie->pci->suspended) {
 		ret = icc_disable(pcie->icc_mem);
