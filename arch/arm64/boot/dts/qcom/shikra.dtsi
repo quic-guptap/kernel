@@ -251,6 +251,18 @@
 			};
 		};
 
+		qfprom: efuse@1b40000 {
+			compatible = "qcom,shikra-qfprom", "qcom,qfprom";
+			reg = <0x0 0x01b40000 0x0 0x700>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			gpu_speed_bin: gpu-speed-bin@6006 {
+				reg = <0x6006 0x2>;
+				bits = <5 8>;
+			};
+		};
+
 		rpm_msg_ram: sram@45f0000 {
 			compatible = "qcom,rpm-msg-ram", "mmio-sram";
 			reg = <0x0 0x045f0000 0x0 0x7000>;
