@@ -50,6 +50,16 @@ config IOMMU_IO_PGTABLE_LPAE_KUNIT_TEST
 
 	  If unsure, say N here.
 
+config IOMMU_IO_PGTABLE_CONTIG_HINT
+	bool "Enable contig hint"
+	depends on IOMMU_IO_PGTABLE_LPAE
+	help
+	  Enable config hint for LPAE page table allocator. This would
+	  allow multiple TLB entries to be combined into a single entry
+	  which optimizes TLB lookups.
+
+	  If unsure, say N here.
+
 config IOMMU_IO_PGTABLE_ARMV7S
 	bool "ARMv7/v8 Short Descriptor Format"
 	select IOMMU_IO_PGTABLE
