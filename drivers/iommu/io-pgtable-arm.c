@@ -459,7 +459,7 @@ static unsigned long arm_get_cont_sizes(struct io_pgtable_cfg *cfg)
 
 	pg_shift = __ffs(cfg->pgsize_bitmap);
 	bits_per_level = pg_shift - ilog2(sizeof(arm_lpae_iopte));
-	pg_size = (1 << pg_shift);
+	pg_size = (1UL << pg_shift);
 	pmd_size = (pg_size << bits_per_level);
 
 	return (ARM_CONT_PTE_SIZE(pg_size) | ARM_CONT_PMD_SIZE(pmd_size));
@@ -756,13 +756,15 @@ static void arm_lpae_cont_unmap(struct arm_lpae_io_pgtable *data,
 	cont_ptep += ARM_LPAE_LVL_IDX(cont_iova, lvl, data);
 	num_entries = round_up(num_entries, arm_lpae_num_cont);
 
+	arm_lpae_iopte *cont_ptep_start = cont_ptep;
+
 	for (itr = 0; itr < num_entries; itr++) {
 		*cont_ptep = (READ_ONCE(*cont_ptep) & ~ARM_LPAE_PTE_CONT);
 		cont_ptep++;
 	}
 
 	if (!cfg->coherent_walk)
-		__arm_lpae_sync_pte(ptep, num_entries, cfg);
+		__arm_lpae_sync_pte(cont_ptep_start, num_entries, cfg);
 }
 #else
 static void arm_lpae_cont_unmap(struct arm_lpae_io_pgtable *data,
@@ -810,7 +812,7 @@ static size_t __arm_lpae_unmap(struct arm_lpae_io_pgtable *data,
 			}
 
 			if (pte & ARM_LPAE_PTE_CONT)
-				arm_lpae_cont_unmap(data, iova, lvl, ptep, pgcount);
+				arm_lpae_cont_unmap(data, iova + i * (size / num_cont), lvl, ptep, pgcount);
 
 			if (!iopte_leaf(pte, lvl, iop->fmt)) {
 				__arm_lpae_clear_pte(&ptep[i], &iop->cfg, 1);
@@ -827,7 +829,7 @@ static size_t __arm_lpae_unmap(struct arm_lpae_io_pgtable *data,
 
 		if (gather && !iommu_iotlb_gather_queued(gather))
 			for (int j = 0; j < i; j++)
-				io_pgtable_tlb_add_page(iop, gather, iova + j * size, size);
+				io_pgtable_tlb_add_page(iop, gather, iova + j * (size / num_cont), size / num_cont);
 
 		return i * (size / num_cont);
 	} else if (iopte_leaf(pte, lvl, iop->fmt)) {
@@ -1094,7 +1096,7 @@ arm_lpae_alloc_pgtable(struct io_pgtable_cfg *cfg)
 	if (!data)
 		return NULL;
 
-	pg_shift = __ffs(cfg->pgsize_bitmap);
+	pg_shift = __ffs(cfg->pgsize_bitmap & (SZ_4K | SZ_16K | SZ_64K));
 	data->bits_per_level = pg_shift - ilog2(sizeof(arm_lpae_iopte));
 
 	va_bits = cfg->ias - pg_shift;
