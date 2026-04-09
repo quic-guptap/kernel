@@ -3,10 +3,13 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
-#include "hamoa.dtsi"
+#include "purwa.dtsi"
 #include "hamoa-pmics.dtsi"
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+
+/delete-node/ &pmc8380_6;
+/delete-node/ &pmc8380_6_thermal;
 
 / {
 	reserved-memory {
@@ -376,25 +379,6 @@
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 	};
-
-	/* PM8010_M */
-	regulators-8 {
-		compatible = "qcom,pm8010-rpmh-regulators";
-		qcom,pmic-id = "m";
-
-		vdd-l3-l4-supply = <&vreg_s4c_1p8>;
-
-		vreg_l4m_1p8: ldo4 {
-			regulator-name = "vrer_l4m_1p8";
-			regulator-min-microvolt = <1800000>;
-			regulator-max-microvolt = <1808000>;
-			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
-		};
-	};
-};
-
-&iris {
-	status = "okay";
 };
 
 &gpu {
@@ -402,7 +386,7 @@
 };
 
 &gpu_zap_shader {
-	firmware-name = "qcom/x1e80100/gen70500_zap.mbn";
+	firmware-name = "qcom/x1p42100/gen71500_zap.mbn";
 };
 
 &pcie3 {
