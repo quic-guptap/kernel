@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ */
+
+/* Common daughter cards nodes to be added:
+ * QPS615 DC
+ * MIC DC
+ * Display DC
+ * Camera DC
+ * USB hub DC
+ * Sensor DC
+ * NFC DC
+ */
