@@ -63,6 +63,16 @@ properties:
 
       - items:
           - enum:
+              - qcom,glymur-crd
+          - const: qcom,glymur
+
+      - items:
+          - enum:
+              - qcom,mahua-crd
+          - const: qcom,mahua
+
+      - items:
+          - enum:
               - fairphone,fp6
           - const: qcom,milos
 
