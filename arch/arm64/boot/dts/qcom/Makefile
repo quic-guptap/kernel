@@ -434,3 +434,56 @@ x1p42100-lenovo-thinkbook-16-el2-dtbs	:= x1p42100-lenovo-thinkbook-16.dtb x1-el2
 dtb-$(CONFIG_ARCH_QCOM)	+= x1p42100-lenovo-thinkbook-16.dtb x1p42100-lenovo-thinkbook-16-el2.dtb
 x1p64100-microsoft-denali-el2-dtbs	:= x1p64100-microsoft-denali.dtb x1-el2.dtbo
 dtb-$(CONFIG_ARCH_QCOM)	+= x1p64100-microsoft-denali.dtb x1p64100-microsoft-denali-el2.dtb
+
+hamoa-evk-camx-dtbs  := hamoa-iot-evk.dtb hamoa-evk-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM)	+= hamoa-evk-camx.dtb
+
+lemans-evk-camx-dtbs	:= lemans-evk.dtb lemans-evk-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM)	+= lemans-evk-camx.dtb
+
+lemans-camx-el2-dtbs	:= lemans-evk-el2.dtb lemans-evk-camx.dtbo lemans-camx-el2.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM)	+= lemans-camx-el2.dtb
+
+monaco-evk-camx-dtbs   := monaco-evk.dtb monaco-evk-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM) += monaco-evk-camx.dtb
+
+monaco-camx-el2-dtbs	:= monaco-evk-el2.dtb monaco-evk-camx.dtbo monaco-camx-el2.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM)	+= monaco-camx-el2.dtb
+
+qcs615-ride-camx-dtbs	:= qcs615-ride.dtb qcs615-ride-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM)	+= qcs615-ride-camx.dtb
+
+qcs6490-rb3gen2-vision-mezzanine-camx-dtbs := qcs6490-rb3gen2-vision-mezzanine.dtb \
+						      qcs6490-rb3gen2-vision-mezzanine-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM) += qcs6490-rb3gen2-vision-mezzanine-camx.dtb
+
+qcs8300-ride-camx-dtbs:= qcs8300-ride.dtb qcs8300-ride-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM) += qcs8300-ride-camx.dtb
+
+qcs9100-ride-camx-dtbs:= qcs9100-ride.dtb sa8775p-ride-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM)	+= qcs9100-ride-camx.dtb
+
+qcs9100-ride-r3-camx-dtbs:= qcs9100-ride-r3.dtb sa8775p-ride-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM)	+= qcs9100-ride-r3-camx.dtb
+
+sa8775p-ride-camx-dtbs:= sa8775p-ride.dtb sa8775p-ride-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM)	+= sa8775p-ride-camx.dtb
+
+sa8775p-ride-r3-camx-dtbs:= sa8775p-ride-r3.dtb sa8775p-ride-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM)	+= sa8775p-ride-r3-camx.dtb
+
+talos-evk-camx-dtbs	:= talos-evk.dtb talos-evk-camx.dtbo
+
+dtb-$(CONFIG_ARCH_QCOM)	+= talos-evk-camx.dtb
