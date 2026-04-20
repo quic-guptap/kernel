@@ -2310,6 +2310,7 @@ static const struct of_device_id qcom_scm_qseecom_allowlist[] __maybe_unused = {
 	{ .compatible = "microsoft,romulus13", },
 	{ .compatible = "microsoft,romulus15", },
 	{ .compatible = "qcom,hamoa-iot-evk" },
+	{ .compatible = "qcom,purwa-iot-evk" },
 	{ .compatible = "qcom,sc8180x-primus" },
 	{ .compatible = "qcom,x1e001de-devkit" },
 	{ .compatible = "qcom,x1e80100-crd" },
@@ -2467,6 +2468,56 @@ int qcom_scm_qtee_callback_response(phys_addr_t buf, size_t buf_size,
 }
 EXPORT_SYMBOL(qcom_scm_qtee_callback_response);
 
+static void qcom_scm_gunyah_wdt_free(void *data)
+{
+	struct platform_device *gunyah_wdt_dev = data;
+
+	platform_device_unregister(gunyah_wdt_dev);
+}
+
+static void qcom_scm_gunyah_wdt_init(struct qcom_scm *scm)
+{
+	struct platform_device *gunyah_wdt_dev;
+	struct device_node *np;
+	bool of_wdt_available;
+	int i;
+	static const uuid_t gunyah_uuid = UUID_INIT(0xc1d58fcd, 0xa453, 0x5fdb,
+						    0x92, 0x65, 0xce, 0x36,
+						    0x67, 0x3d, 0x5f, 0x14);
+	static const char * const of_wdt_compatible[] = {
+		"qcom,kpss-wdt",
+		"arm,sbsa-gwdt",
+	};
+
+	/* Bail out if we are not running under Gunyah */
+	if (!IS_ENABLED(CONFIG_HAVE_ARM_SMCCC_DISCOVERY) ||
+	    !arm_smccc_hypervisor_has_uuid(&gunyah_uuid))
+		return;
+
+	/*
+	 * Gunyah emulates either of Qualcomm watchdog or ARM SBSA watchdog on
+	 * newer platforms. Bail out if we find them in the devicetree.
+	 */
+	for (i = 0; i < ARRAY_SIZE(of_wdt_compatible); i++) {
+		np = of_find_compatible_node(NULL, NULL, of_wdt_compatible[i]);
+		of_wdt_available = of_device_is_available(np);
+		of_node_put(np);
+		if (of_wdt_available)
+			return;
+	}
+
+	gunyah_wdt_dev = platform_device_register_simple("gunyah-wdt", -1,
+							 NULL, 0);
+	if (IS_ERR(gunyah_wdt_dev)) {
+		dev_err(scm->dev, "Failed to register Gunyah watchdog device: %ld\n",
+			PTR_ERR(gunyah_wdt_dev));
+		return;
+	}
+
+	devm_add_action_or_reset(scm->dev, qcom_scm_gunyah_wdt_free,
+				 gunyah_wdt_dev);
+}
+
 static void qcom_scm_qtee_free(void *data)
 {
 	struct platform_device *qtee_dev = data;
@@ -2507,6 +2558,51 @@ bool qcom_scm_is_available(void)
 	return !!smp_load_acquire(&__scm);
 }
 EXPORT_SYMBOL_GPL(qcom_scm_is_available);
+
+int qcom_scm_camera_update_camnoc_qos(uint32_t use_case_id,
+	uint32_t cam_qos_cnt, struct qcom_scm_camera_qos *cam_qos)
+{
+	int ret;
+	dma_addr_t payload_phys;
+	u32 *payload_buf = NULL;
+	u32 payload_size = 0;
+
+	if ((cam_qos_cnt > QCOM_SCM_CAMERA_MAX_QOS_CNT) || (cam_qos_cnt && !cam_qos)) {
+		pr_err("Invalid input SmartQoS count: %d\n", cam_qos_cnt);
+		return -EINVAL;
+	}
+
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_CAMERA,
+		.cmd = QCOM_SCM_CAMERA_UPDATE_CAMNOC_QOS,
+		.owner = ARM_SMCCC_OWNER_SIP,
+		.args[0] = use_case_id,
+		.args[2] = payload_size,
+		.arginfo = QCOM_SCM_ARGS(3, QCOM_SCM_VAL, QCOM_SCM_RW, QCOM_SCM_VAL),
+	};
+
+	payload_size = cam_qos_cnt * sizeof(struct qcom_scm_camera_qos);
+
+	/* fill all required qos settings */
+	if (use_case_id && payload_size && cam_qos) {
+		payload_buf = dma_alloc_coherent(__scm->dev,
+						 payload_size, &payload_phys, GFP_KERNEL);
+		if (!payload_buf)
+			return -ENOMEM;
+
+		memcpy(payload_buf, cam_qos, payload_size);
+		desc.args[1] = payload_phys;
+		desc.args[2] = payload_size;
+
+	}
+	ret = qcom_scm_call(__scm->dev, &desc, NULL);
+
+	if (payload_buf)
+		dma_free_coherent(__scm->dev, payload_size, payload_buf, payload_phys);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_scm_camera_update_camnoc_qos);
 
 static int qcom_scm_fill_irq_fwspec_params(struct irq_fwspec *fwspec, u32 hwirq)
 {
@@ -2810,6 +2906,9 @@ static int qcom_scm_probe(struct platform_device *pdev)
 
 	/* Initialize the QTEE object interface. */
 	qcom_scm_qtee_init(scm);
+
+	/* Initialize the Gunyah watchdog platform device. */
+	qcom_scm_gunyah_wdt_init(scm);
 
 	return 0;
 }

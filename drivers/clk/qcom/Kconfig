@@ -19,6 +19,16 @@ menuconfig COMMON_CLK_QCOM
 
 if COMMON_CLK_QCOM
 
+config CLK_GLYMUR_CAMCC
+	tristate "Glymur Camera Clock Controller"
+	depends on ARM64 || COMPILE_TEST
+	select CLK_GLYMUR_GCC
+	help
+	  Support for the camera clock controller on Qualcomm Technologies, Inc
+	  Glymur devices.
+	  Say Y if you want to support camera devices and functionality such as
+	  capturing pictures.
+
 config CLK_GLYMUR_DISPCC
 	tristate "GLYMUR Display Clock Controller"
 	depends on ARM64 || COMPILE_TEST
@@ -38,6 +48,15 @@ config CLK_GLYMUR_GCC
 	  Say Y if you want to use peripheral devices such as UART, SPI,
 	  I2C, USB, UFS, SDCC, etc.
 
+config CLK_GLYMUR_GPUCC
+	tristate "GLYMUR Graphics Clock Controller"
+	depends on ARM64 || COMPILE_TEST
+	select CLK_GLYMUR_GCC
+	help
+	  Support for the graphics clock controller on GLYMUR devices.
+	  Say Y if you want to support graphics controller devices and
+	  functionality such as 3D graphics.
+
 config CLK_GLYMUR_TCSRCC
 	tristate "GLYMUR TCSR Clock Controller"
 	depends on ARM64 || COMPILE_TEST
@@ -45,6 +64,15 @@ config CLK_GLYMUR_TCSRCC
 	help
 	  Support for the TCSR clock controller on GLYMUR devices.
 	  Say Y if you want to use peripheral devices such as USB/PCIe/EDP.
+
+config CLK_GLYMUR_VIDEOCC
+	tristate "Glymur Video Clock Controller"
+	depends on ARM64 || COMPILE_TEST
+	select CLK_GLYMUR_GCC
+	help
+	  Support for the video clock controller on Glymur devices.
+	  Say Y if you want to support video devices and functionality such as
+	  video encode and decode.
 
 config CLK_KAANAPALI_CAMCC
 	tristate "Kaanapali Camera Clock Controller"
@@ -101,6 +129,15 @@ config CLK_KAANAPALI_VIDEOCC
 	  Say Y if you want to support video devices and functionality such as
 	  video encode/decode.
 
+config CLK_SHIKRA_GCC
+	tristate "Shikra Global Clock Controller"
+	depends on ARM64 || COMPILE_TEST
+	select QCOM_GDSC
+	help
+	  Support for the global clock controller on Shikra devices.
+	  Say Y if you want to use multimedia devices or peripheral
+	  devices such as Camera, Video, UART, SPI, I2C, USB, SD/eMMC etc.
+
 config CLK_X1E80100_CAMCC
 	tristate "X1E80100 Camera Clock Controller"
 	depends on ARM64 || COMPILE_TEST
@@ -146,6 +183,16 @@ config CLK_X1E80100_TCSRCC
 	  Support for the TCSR clock controller on X1E80100 devices.
 	  Say Y if you want to use peripheral devices such as SD/UFS.
 
+config CLK_X1P42100_CAMCC
+	tristate "X1P42100 Camera Clock Controller"
+	depends on ARM64 || COMPILE_TEST
+	select CLK_X1E80100_GCC
+	help
+	  Support for the camera clock controller on Qualcomm Technologies, Inc.
+	  X1P42100 devices.
+	  Say Y if you want to support camera devices and camera functionality
+	  such as capturing pictures.
+
 config CLK_X1P42100_GPUCC
 	tristate "X1P42100 Graphics Clock Controller"
 	depends on ARM64 || COMPILE_TEST
@@ -154,6 +201,16 @@ config CLK_X1P42100_GPUCC
 	  Support for the graphics clock controller on X1P42100 devices.
 	  Say Y if you want to support graphics controller devices and
 	  functionality such as 3D graphics.
+
+config CLK_X1P42100_VIDEOCC
+	tristate "X1P42100 Video Clock Controller"
+	depends on ARM64 || COMPILE_TEST
+	select CLK_X1E80100_GCC
+	help
+	  Support for the video clock controller on Qualcomm Technologies, Inc.
+	  X1P42100 devices.
+	  Say Y if you want to support video devices and functionality such as
+	  video encode/decode.
 
 config CLK_QCM2290_GPUCC
 	tristate "QCM2290 Graphics Clock Controller"
@@ -1478,6 +1535,15 @@ config SM_GPUCC_8650
 	select SM_GCC_8650
 	help
 	  Support for the graphics clock controller on SM8650 devices.
+	  Say Y if you want to support graphics controller devices and
+	  functionality such as 3D graphics.
+
+config SM_GPUCC_8750
+	tristate "SM8750 Graphics Clock Controller"
+	depends on ARM64 || COMPILE_TEST
+	select SM_GCC_8750
+	help
+	  Support for the graphics clock controller on SM8750 devices.
 	  Say Y if you want to support graphics controller devices and
 	  functionality such as 3D graphics.
 

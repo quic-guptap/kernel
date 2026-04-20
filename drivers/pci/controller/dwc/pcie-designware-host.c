@@ -1165,17 +1165,6 @@ int dw_pcie_setup_rc(struct dw_pcie_rp *pp)
 
 	dw_pcie_dbi_ro_wr_dis(pci);
 
-	/*
-	 * The iMSI-RX module does not support receiving MSI or MSI-X generated
-	 * by the Root Port. If iMSI-RX is used as the MSI controller, remove
-	 * the MSI and MSI-X capabilities of the Root Port to allow the drivers
-	 * to fall back to INTx instead.
-	 */
-	if (pp->use_imsi_rx) {
-		dw_pcie_remove_capability(pci, PCI_CAP_ID_MSI);
-		dw_pcie_remove_capability(pci, PCI_CAP_ID_MSIX);
-	}
-
 	return 0;
 }
 EXPORT_SYMBOL_GPL(dw_pcie_setup_rc);
@@ -1218,18 +1207,13 @@ static int dw_pcie_pme_turn_off(struct dw_pcie *pci)
 
 int dw_pcie_suspend_noirq(struct dw_pcie *pci)
 {
-	u8 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
 	int ret = 0;
 	u32 val;
 
 	if (!dw_pcie_link_up(pci))
 		goto stop_link;
 
-	/*
-	 * If L1SS is supported, then do not put the link into L2 as some
-	 * devices such as NVMe expect low resume latency.
-	 */
-	if (dw_pcie_readw_dbi(pci, offset + PCI_EXP_LNKCTL) & PCI_EXP_LNKCTL_ASPM_L1)
+	if (!pci_host_common_can_enter_d3cold(pci->pp.bridge))
 		return 0;
 
 	if (pci->pp.ops->pme_turn_off) {
