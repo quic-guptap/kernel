@@ -10,3 +10,7 @@ zram-$(CONFIG_ZRAM_BACKEND_DEFLATE)	+= backend_deflate.o
 zram-$(CONFIG_ZRAM_BACKEND_842)		+= backend_842.o
 
 obj-$(CONFIG_ZRAM)	+=	zram.o
+
+# Test module for zram_get_compr_size_for_swp_entry()
+# Built-in (not loadable) so it can access non-exported kernel symbols.
+obj-$(CONFIG_ZRAM)	+=	zram_compr_test.o
