@@ -34,6 +34,8 @@
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
 #include <linux/rcupdate.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
 
 #include "zram_drv.h"
 
@@ -2804,6 +2806,68 @@ static void zram_slot_free_notify(struct block_device *bdev,
 	slot_free(zram, index);
 	slot_unlock(zram, index);
 }
+
+/**
+ * zram_get_compr_size_for_swp_entry - compressed size of a swap entry in ZRAM
+ * @entry: swap entry to look up
+ *
+ * Returns the number of bytes the page occupies in ZRAM after compression, or
+ * 0 if the entry does not reside on a ZRAM device or the slot is unallocated.
+ *
+ * Special cases:
+ *  - ZRAM_SAME (all bytes identical): returns sizeof(unsigned long) since
+ *    only one word is stored.
+ *  - ZRAM_WB (written back to backing device): returns PAGE_SIZE since the
+ *    page is no longer held in compressed form inside ZRAM.
+ *
+ * This function is the key building block for per-process ZRAM footprint
+ * accounting.  Walk the process page tables, call this for every swap PTE,
+ * and sum the results to obtain the true compressed RSS in ZRAM.
+ *
+ * Context: may sleep; must not be called from atomic context.
+ */
+size_t zram_get_compr_size_for_swp_entry(swp_entry_t entry)
+{
+	struct swap_info_struct *si;
+	struct zram *zram;
+	pgoff_t offset;
+	size_t size = 0;
+
+	si = get_swap_device(entry);
+	if (!si)
+		return 0;
+
+	/* Only block-device swap can be ZRAM */
+	if (!(si->flags & SWP_BLKDEV) || !si->bdev)
+		goto out;
+
+	if (MAJOR(si->bdev->bd_dev) != zram_major)
+		goto out;
+
+	zram = si->bdev->bd_disk->private_data;
+	if (!zram || !init_done(zram))
+		goto out;
+
+	offset = swp_offset(entry);
+	if (offset >= zram->disksize >> PAGE_SHIFT)
+		goto out;
+
+	slot_lock(zram, offset);
+	if (slot_allocated(zram, offset)) {
+		if (test_slot_flag(zram, offset, ZRAM_SAME))
+			size = sizeof(unsigned long);
+		else if (test_slot_flag(zram, offset, ZRAM_WB))
+			size = PAGE_SIZE;
+		else
+			size = get_slot_size(zram, offset);
+	}
+	slot_unlock(zram, offset);
+
+out:
+	put_swap_device(si);
+	return size;
+}
+EXPORT_SYMBOL_GPL(zram_get_compr_size_for_swp_entry);
 
 static void zram_comp_params_reset(struct zram *zram)
 {
