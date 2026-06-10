@@ -50,6 +50,22 @@ config IOMMU_IO_PGTABLE_LPAE_KUNIT_TEST
 
 	  If unsure, say N here.
 
+config IOMMU_SMMUTEST
+	tristate "SMMUv3 iommu_map/iommu_unmap test driver"
+	depends on ARM_SMMU_V3 && PCI
+	help
+	  Loadable test module for exercising SMMUv3 translation paths via
+	  iommu_map()/iommu_unmap() and iova-to-phys checks.
+
+	  Exposes sysfs nodes under /sys/kernel/smmutest/:
+	    iommu_map              - W: "<iova_hex> <pa_hex> <size_hex>"
+	    iommu_unmap            - W: "<iova_hex> <size_hex>"
+	    dump                   - W: "1" or "<iova_hex> <size_hex>"
+	    run_contig_hint_test   - W: "1"
+	    state                  - R: current mapping and test status
+
+	  If unsure, say N here.
+
 config IOMMU_IO_PGTABLE_ARMV7S
 	bool "ARMv7/v8 Short Descriptor Format"
 	select IOMMU_IO_PGTABLE

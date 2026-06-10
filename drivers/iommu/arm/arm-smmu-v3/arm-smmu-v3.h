@@ -1226,4 +1226,7 @@ static inline int arm_vmaster_report_event(struct arm_smmu_vmaster *vmaster,
 }
 #endif /* CONFIG_ARM_SMMU_V3_IOMMUFD */
 
+int arm_smmuv3_pgtable_walk(struct iommu_domain *domain, unsigned long iova,
+			    struct arm_lpae_io_pgtable_walk_data *wd);
+
 #endif /* _ARM_SMMU_V3_H */

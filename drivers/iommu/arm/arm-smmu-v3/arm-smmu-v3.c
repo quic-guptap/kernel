@@ -4079,6 +4079,18 @@ arm_smmu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
 	return ops->iova_to_phys(ops, iova);
 }
 
+int arm_smmuv3_pgtable_walk(struct iommu_domain *domain, unsigned long iova,
+			    struct arm_lpae_io_pgtable_walk_data *wd)
+{
+	struct io_pgtable_ops *ops = to_smmu_domain(domain)->pgtbl_ops;
+
+	if (!ops || !ops->pgtable_walk)
+		return -EOPNOTSUPP;
+
+	return ops->pgtable_walk(ops, iova, wd);
+}
+EXPORT_SYMBOL_GPL(arm_smmuv3_pgtable_walk);
+
 static struct platform_driver arm_smmu_driver;
 
 static
