@@ -23,6 +23,7 @@
 #include <linux/minmax.h>
 #include <linux/overflow.h>
 #include <linux/buildid.h>
+#include <linux/zram_compr.h>
 
 #include <asm/elf.h>
 #include <asm/tlb.h>
@@ -881,6 +882,7 @@ struct mem_size_stats {
 	u64 pss_dirty;
 	u64 pss_locked;
 	u64 swap_pss;
+	u64 swap_compressed;
 };
 
 static void smaps_page_accumulate(struct mem_size_stats *mss,
@@ -1037,6 +1039,21 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 
 		if (softleaf_is_swap(entry)) {
 			int mapcount;
+
+			/* Accumulate PSS-adjusted ZRAM compressed bytes */
+			size_t zram_size = zram_get_compr_size_for_swp_entry(entry);
+
+			if (zram_size) {
+				mapcount = swp_swapcount(entry);
+				if (mapcount >= 2) {
+					u64 zram_pss = zram_size;
+
+					do_div(zram_pss, mapcount);
+					mss->swap_compressed += zram_pss;
+				} else {
+					mss->swap_compressed += zram_size;
+				}
+			}
 
 			mss->swap += PAGE_SIZE;
 			mapcount = swp_swapcount(entry);
@@ -1362,6 +1379,8 @@ static void __show_smap(struct seq_file *m, const struct mem_size_stats *mss,
 	SEQ_PUT_DEC(" kB\nSwap:           ", mss->swap);
 	SEQ_PUT_DEC(" kB\nSwapPss:        ",
 					mss->swap_pss >> PSS_SHIFT);
+	SEQ_PUT_DEC(" kB\nSwapCompressed: ",
+					mss->swap_compressed >> 10);
 	SEQ_PUT_DEC(" kB\nLocked:         ",
 					mss->pss_locked >> PSS_SHIFT);
 	seq_puts(m, " kB\n");
