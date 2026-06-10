@@ -470,6 +470,7 @@ Memory Area, or VMA) there is a series of lines such as the following::
     Private_Hugetlb:       0 kB
     Swap:                  0 kB
     SwapPss:               0 kB
+    SwapCompressed:        0 kB
     Locked:                0 kB
     THPeligible:           0
     VmFlags: rd ex mr mw me dw
@@ -559,6 +560,12 @@ For shmem mappings, "Swap" includes also the size of the mapped (and not
 replaced by copy-on-write) part of the underlying shmem object out on swap.
 "SwapPss" shows proportional swap share of this mapping. Unlike "Swap", this
 does not take into account swapped out page of underlying shmem objects.
+
+"SwapCompressed" shows the compressed size in memory of swap pages for this
+process. Currently covers ZRAM-backed swap only; shows 0 for non-ZRAM swap or
+file-backed pages. Support for other compressed swap backends (e.g., zswap) is
+planned.
+
 "Locked" indicates whether the mapping is locked in memory or not.
 
 "THPeligible" indicates whether the mapping is eligible for allocating

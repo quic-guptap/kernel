@@ -1380,7 +1380,7 @@ static void __show_smap(struct seq_file *m, const struct mem_size_stats *mss,
 	SEQ_PUT_DEC(" kB\nSwapPss:        ",
 					mss->swap_pss >> PSS_SHIFT);
 	SEQ_PUT_DEC(" kB\nSwapCompressed: ",
-					mss->swap_compressed >> 10);
+					mss->swap_compressed);
 	SEQ_PUT_DEC(" kB\nLocked:         ",
 					mss->pss_locked >> PSS_SHIFT);
 	seq_puts(m, " kB\n");
