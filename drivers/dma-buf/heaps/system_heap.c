@@ -14,6 +14,7 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-heap.h>
+#include <uapi/linux/dma-heap.h>
 #include <linux/err.h>
 #include <linux/highmem.h>
 #include <linux/mem_encrypt.h>
@@ -372,6 +373,26 @@ static const struct dma_buf_ops system_heap_buf_ops = {
 	.release = system_heap_dma_buf_release,
 };
 
+/**
+ * heap_flags_to_max_order - translate heap allocation flags to max page order
+ * @heap_flags: flags from dma_heap_allocation_data.heap_flags
+ *
+ * Returns the maximum page order the heap should attempt for this allocation:
+ *   - DMA_HEAP_ALLOC_NOHUGEPAGE: 0         (order-0 only, skip high-order)
+ *   - DMA_HEAP_ALLOC_HUGEPAGE:   orders[0] (largest supported order)
+ *   - 0 (no hint):               orders[0] (existing behavior, unchanged)
+ *
+ * The caller is responsible for ensuring HUGEPAGE and NOHUGEPAGE are not
+ * both set (validated in dma_heap_ioctl_allocate).
+ */
+static unsigned int heap_flags_to_max_order(u64 heap_flags)
+{
+	if (heap_flags & DMA_HEAP_ALLOC_NOHUGEPAGE)
+		return 0;
+	/* DMA_HEAP_ALLOC_HUGEPAGE or no hint: use largest order */
+	return orders[0];
+}
+
 static struct page *alloc_largest_available(unsigned long size,
 					    unsigned int max_order)
 {
@@ -403,7 +424,7 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 	struct system_heap_buffer *buffer;
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	unsigned long size_remaining = len;
-	unsigned int max_order = orders[0];
+	unsigned int max_order = heap_flags_to_max_order(heap_flags);
 	struct system_heap_priv *priv = dma_heap_get_drvdata(heap);
 	bool cc_shared = priv->cc_shared;
 	struct dma_buf *dmabuf;

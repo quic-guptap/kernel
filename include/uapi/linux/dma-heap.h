@@ -18,8 +18,37 @@
 /* Valid FD_FLAGS are O_CLOEXEC, O_RDONLY, O_WRONLY, O_RDWR */
 #define DMA_HEAP_VALID_FD_FLAGS (O_CLOEXEC | O_ACCMODE)
 
-/* Currently no heap flags */
-#define DMA_HEAP_VALID_HEAP_FLAGS (0ULL)
+/**
+ * DOC: DMA Heap Allocation Hints
+ *
+ * The heap_flags field in struct dma_heap_allocation_data carries advisory
+ * hints that influence how the heap satisfies the allocation request.
+ *
+ * DMA_HEAP_ALLOC_HUGEPAGE:
+ *   Request that the heap prefer higher-order compound pages for this
+ *   allocation. Heaps that support this hint will attempt to use the largest
+ *   available page order (e.g. order-8 = 1MB on most systems) before falling
+ *   back to smaller orders. This reduces IOMMU TLB pressure for large buffers.
+ *
+ *   This flag mirrors the effect of madvise(MADV_HUGEPAGE) for DMA memory.
+ *   The hint is advisory: the heap may use smaller pages if higher-order
+ *   pages are unavailable.
+ *
+ * DMA_HEAP_ALLOC_NOHUGEPAGE:
+ *   Request that the heap use only base-page (order-0) allocations. Heaps
+ *   that support this hint will skip high-order allocation attempts, reducing
+ *   allocation latency for small or latency-sensitive buffers.
+ *
+ *   This flag mirrors the effect of madvise(MADV_NOHUGEPAGE) for DMA memory.
+ *
+ * These flags are mutually exclusive. Passing both returns -EINVAL.
+ * Heaps that do not implement hugepage awareness silently ignore these flags.
+ */
+#define DMA_HEAP_ALLOC_HUGEPAGE		(1ULL << 0)
+#define DMA_HEAP_ALLOC_NOHUGEPAGE	(1ULL << 1)
+
+#define DMA_HEAP_VALID_HEAP_FLAGS \
+	(DMA_HEAP_ALLOC_HUGEPAGE | DMA_HEAP_ALLOC_NOHUGEPAGE)
 
 /**
  * struct dma_heap_allocation_data - metadata passed from userspace for

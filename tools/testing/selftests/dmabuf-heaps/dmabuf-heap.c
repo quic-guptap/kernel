@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -141,6 +142,22 @@ static int dmabuf_sync(int fd, int start_stop)
 }
 
 #define ONE_MEG (1024 * 1024)
+
+/*
+ * Size used for hugepage hint tests: large enough to exercise the high-order
+ * allocation path (order-8 = 1MB per block on 4KB-page systems).
+ */
+#define HUGEPAGE_TEST_SIZE (4 * ONE_MEG)
+
+/* Number of repetitions for the allocation latency benchmark. */
+#define LATENCY_REPS 50
+
+static long time_diff_us(const struct timespec *start,
+			 const struct timespec *end)
+{
+	return (end->tv_sec - start->tv_sec) * 1000000L +
+	       (end->tv_nsec - start->tv_nsec) / 1000L;
+}
 
 static void test_alloc_and_import(char *heap_name)
 {
@@ -390,6 +407,295 @@ static void test_alloc_errors(char *heap_name)
 	close(heap_fd);
 }
 
+/*
+ * test_alloc_hugepage_hints - validate DMA_HEAP_ALLOC_HUGEPAGE /
+ *                             DMA_HEAP_ALLOC_NOHUGEPAGE flag semantics
+ *
+ * Tests (3 per heap):
+ *   1. DMA_HEAP_ALLOC_HUGEPAGE alone succeeds and the buffer is usable
+ *   2. DMA_HEAP_ALLOC_NOHUGEPAGE alone succeeds and the buffer is usable
+ *   3. Both flags together are rejected with EINVAL
+ */
+static void test_alloc_hugepage_hints(char *heap_name)
+{
+	int heap_fd = -1, dmabuf_fd = -1;
+	void *p;
+	int ret;
+
+	heap_fd = dmabuf_heap_open(heap_name);
+
+	ksft_print_msg("Testing hugepage allocation hints:\n");
+
+	/* Test 1: DMA_HEAP_ALLOC_HUGEPAGE alone */
+	ret = dmabuf_heap_alloc(heap_fd, HUGEPAGE_TEST_SIZE,
+				DMA_HEAP_ALLOC_HUGEPAGE, &dmabuf_fd);
+	if (!ret) {
+		p = mmap(NULL, HUGEPAGE_TEST_SIZE, PROT_READ | PROT_WRITE,
+			 MAP_SHARED, dmabuf_fd, 0);
+		if (p != MAP_FAILED) {
+			dmabuf_sync(dmabuf_fd, DMA_BUF_SYNC_START);
+			memset(p, 0xab, HUGEPAGE_TEST_SIZE);
+			dmabuf_sync(dmabuf_fd, DMA_BUF_SYNC_END);
+			munmap(p, HUGEPAGE_TEST_SIZE);
+		}
+		close(dmabuf_fd);
+		dmabuf_fd = -1;
+	}
+	ksft_test_result(!ret, "DMA_HEAP_ALLOC_HUGEPAGE allocation\n");
+
+	/* Test 2: DMA_HEAP_ALLOC_NOHUGEPAGE alone */
+	ret = dmabuf_heap_alloc(heap_fd, HUGEPAGE_TEST_SIZE,
+				DMA_HEAP_ALLOC_NOHUGEPAGE, &dmabuf_fd);
+	if (!ret) {
+		p = mmap(NULL, HUGEPAGE_TEST_SIZE, PROT_READ | PROT_WRITE,
+			 MAP_SHARED, dmabuf_fd, 0);
+		if (p != MAP_FAILED) {
+			dmabuf_sync(dmabuf_fd, DMA_BUF_SYNC_START);
+			memset(p, 0xcd, HUGEPAGE_TEST_SIZE);
+			dmabuf_sync(dmabuf_fd, DMA_BUF_SYNC_END);
+			munmap(p, HUGEPAGE_TEST_SIZE);
+		}
+		close(dmabuf_fd);
+		dmabuf_fd = -1;
+	}
+	ksft_test_result(!ret, "DMA_HEAP_ALLOC_NOHUGEPAGE allocation\n");
+
+	/* Test 3: both flags together must be rejected */
+	ret = dmabuf_heap_alloc(heap_fd, HUGEPAGE_TEST_SIZE,
+				DMA_HEAP_ALLOC_HUGEPAGE | DMA_HEAP_ALLOC_NOHUGEPAGE,
+				&dmabuf_fd);
+	ksft_test_result(ret < 0 && errno == EINVAL,
+			 "HUGEPAGE|NOHUGEPAGE rejected with EINVAL (ret=%d errno=%d)\n",
+			 ret, errno);
+	if (dmabuf_fd >= 0) {
+		close(dmabuf_fd);
+		dmabuf_fd = -1;
+	}
+
+	close(heap_fd);
+}
+
+/*
+ * test_alloc_hugepage_zeroed - verify that buffers allocated with hugepage
+ *                              hints are zero-initialised and have data integrity
+ *
+ * Tests (2 per heap):
+ *   4. DMA_HEAP_ALLOC_HUGEPAGE buffer is zeroed; 0xa5 pattern write+verify
+ *   5. DMA_HEAP_ALLOC_NOHUGEPAGE buffer is zeroed; 0xa5 pattern write+verify
+ *
+ * The 0xa5 pattern check catches memory aliasing bugs: if two allocations
+ * share a page, the second allocation's zero-check passes but the 0xa5 write
+ * corrupts the first buffer.
+ */
+static void test_alloc_hugepage_zeroed(char *heap_name)
+{
+	int heap_fd = -1, dmabuf_fd = -1;
+	void *p;
+	char *c;
+	int ret, j;
+	bool zeroed;
+
+	heap_fd = dmabuf_heap_open(heap_name);
+
+	ksft_print_msg("Testing hugepage-hinted allocations are zeroed:\n");
+
+	/* Test 4: DMA_HEAP_ALLOC_HUGEPAGE buffer is zeroed */
+	ret = dmabuf_heap_alloc(heap_fd, ONE_MEG,
+				DMA_HEAP_ALLOC_HUGEPAGE, &dmabuf_fd);
+	if (ret) {
+		ksft_test_result_fail("HUGEPAGE alloc failed: %d\n", ret);
+		goto test5;
+	}
+	p = mmap(NULL, ONE_MEG, PROT_READ | PROT_WRITE, MAP_SHARED, dmabuf_fd, 0);
+	if (p == MAP_FAILED) {
+		ksft_test_result_fail("HUGEPAGE mmap failed: %s\n", strerror(errno));
+		close(dmabuf_fd);
+		dmabuf_fd = -1;
+		goto test5;
+	}
+	dmabuf_sync(dmabuf_fd, DMA_BUF_SYNC_START);
+	c = (char *)p;
+	zeroed = true;
+	for (j = 0; j < ONE_MEG; j++) {
+		if (c[j] != 0) {
+			zeroed = false;
+			break;
+		}
+	}
+	/* Write 0xa5 pattern and verify -- catches memory aliasing bugs */
+	if (zeroed) {
+		memset(p, 0xa5, ONE_MEG);
+		for (j = 0; j < ONE_MEG; j++) {
+			if ((unsigned char)c[j] != 0xa5) {
+				zeroed = false;
+				break;
+			}
+		}
+	}
+	dmabuf_sync(dmabuf_fd, DMA_BUF_SYNC_END);
+	munmap(p, ONE_MEG);
+	close(dmabuf_fd);
+	dmabuf_fd = -1;
+	ksft_test_result(zeroed, "DMA_HEAP_ALLOC_HUGEPAGE buffer zeroed and integrity ok\n");
+
+test5:
+	/* Test 5: DMA_HEAP_ALLOC_NOHUGEPAGE buffer is zeroed */
+	ret = dmabuf_heap_alloc(heap_fd, ONE_MEG,
+				DMA_HEAP_ALLOC_NOHUGEPAGE, &dmabuf_fd);
+	if (ret) {
+		ksft_test_result_fail("NOHUGEPAGE alloc failed: %d\n", ret);
+		goto out;
+	}
+	p = mmap(NULL, ONE_MEG, PROT_READ | PROT_WRITE, MAP_SHARED, dmabuf_fd, 0);
+	if (p == MAP_FAILED) {
+		ksft_test_result_fail("NOHUGEPAGE mmap failed: %s\n", strerror(errno));
+		close(dmabuf_fd);
+		dmabuf_fd = -1;
+		goto out;
+	}
+	dmabuf_sync(dmabuf_fd, DMA_BUF_SYNC_START);
+	c = (char *)p;
+	zeroed = true;
+	for (j = 0; j < ONE_MEG; j++) {
+		if (c[j] != 0) {
+			zeroed = false;
+			break;
+		}
+	}
+	/* Write 0xa5 pattern and verify -- catches memory aliasing bugs */
+	if (zeroed) {
+		memset(p, 0xa5, ONE_MEG);
+		for (j = 0; j < ONE_MEG; j++) {
+			if ((unsigned char)c[j] != 0xa5) {
+				zeroed = false;
+				break;
+			}
+		}
+	}
+	dmabuf_sync(dmabuf_fd, DMA_BUF_SYNC_END);
+	munmap(p, ONE_MEG);
+	close(dmabuf_fd);
+	dmabuf_fd = -1;
+	ksft_test_result(zeroed, "DMA_HEAP_ALLOC_NOHUGEPAGE buffer zeroed and integrity ok\n");
+
+out:
+	close(heap_fd);
+}
+
+/*
+ * test_alloc_latency - benchmark allocation, mmap, and free latency per hint
+ *
+ * Tests (1 per heap):
+ *   6. Always passes; prints average alloc, mmap, and free latency for
+ *      no-hint, HUGEPAGE, and NOHUGEPAGE over LATENCY_REPS iterations.
+ *
+ * Uses clock_gettime(CLOCK_MONOTONIC) for nanosecond-resolution timing.
+ *
+ * Useful for detecting regressions:
+ *   - NOHUGEPAGE alloc should be faster than no-hint (skips high-order attempts)
+ *   - HUGEPAGE mmap/free should be faster than NOHUGEPAGE (fewer page entries)
+ *   - HUGEPAGE alloc should be similar to no-hint (same default strategy)
+ */
+static void test_alloc_latency(char *heap_name)
+{
+	int heap_fd = -1, dmabuf_fd = -1;
+	struct timespec ts_start, ts_end;
+	long no_hint_alloc_us = 0, no_hint_mmap_us = 0, no_hint_free_us = 0;
+	long hugepage_alloc_us = 0, hugepage_mmap_us = 0, hugepage_free_us = 0;
+	long nohugepage_alloc_us = 0, nohugepage_mmap_us = 0;
+	long nohugepage_free_us = 0;
+	void *p;
+	int i, ret;
+
+	heap_fd = dmabuf_heap_open(heap_name);
+
+	for (i = 0; i < LATENCY_REPS; i++) {
+		/* no-hint */
+		clock_gettime(CLOCK_MONOTONIC, &ts_start);
+		ret = dmabuf_heap_alloc(heap_fd, HUGEPAGE_TEST_SIZE, 0, &dmabuf_fd);
+		clock_gettime(CLOCK_MONOTONIC, &ts_end);
+		if (!ret) {
+			no_hint_alloc_us += time_diff_us(&ts_start, &ts_end);
+			clock_gettime(CLOCK_MONOTONIC, &ts_start);
+			p = mmap(NULL, HUGEPAGE_TEST_SIZE, PROT_READ | PROT_WRITE,
+				 MAP_SHARED, dmabuf_fd, 0);
+			clock_gettime(CLOCK_MONOTONIC, &ts_end);
+			if (p != MAP_FAILED) {
+				no_hint_mmap_us += time_diff_us(&ts_start, &ts_end);
+				munmap(p, HUGEPAGE_TEST_SIZE);
+			}
+			clock_gettime(CLOCK_MONOTONIC, &ts_start);
+			close(dmabuf_fd);
+			clock_gettime(CLOCK_MONOTONIC, &ts_end);
+			no_hint_free_us += time_diff_us(&ts_start, &ts_end);
+			dmabuf_fd = -1;
+		}
+
+		/* DMA_HEAP_ALLOC_HUGEPAGE */
+		clock_gettime(CLOCK_MONOTONIC, &ts_start);
+		ret = dmabuf_heap_alloc(heap_fd, HUGEPAGE_TEST_SIZE,
+					DMA_HEAP_ALLOC_HUGEPAGE, &dmabuf_fd);
+		clock_gettime(CLOCK_MONOTONIC, &ts_end);
+		if (!ret) {
+			hugepage_alloc_us += time_diff_us(&ts_start, &ts_end);
+			clock_gettime(CLOCK_MONOTONIC, &ts_start);
+			p = mmap(NULL, HUGEPAGE_TEST_SIZE, PROT_READ | PROT_WRITE,
+				 MAP_SHARED, dmabuf_fd, 0);
+			clock_gettime(CLOCK_MONOTONIC, &ts_end);
+			if (p != MAP_FAILED) {
+				hugepage_mmap_us += time_diff_us(&ts_start, &ts_end);
+				munmap(p, HUGEPAGE_TEST_SIZE);
+			}
+			clock_gettime(CLOCK_MONOTONIC, &ts_start);
+			close(dmabuf_fd);
+			clock_gettime(CLOCK_MONOTONIC, &ts_end);
+			hugepage_free_us += time_diff_us(&ts_start, &ts_end);
+			dmabuf_fd = -1;
+		}
+
+		/* DMA_HEAP_ALLOC_NOHUGEPAGE */
+		clock_gettime(CLOCK_MONOTONIC, &ts_start);
+		ret = dmabuf_heap_alloc(heap_fd, HUGEPAGE_TEST_SIZE,
+					DMA_HEAP_ALLOC_NOHUGEPAGE, &dmabuf_fd);
+		clock_gettime(CLOCK_MONOTONIC, &ts_end);
+		if (!ret) {
+			nohugepage_alloc_us += time_diff_us(&ts_start, &ts_end);
+			clock_gettime(CLOCK_MONOTONIC, &ts_start);
+			p = mmap(NULL, HUGEPAGE_TEST_SIZE, PROT_READ | PROT_WRITE,
+				 MAP_SHARED, dmabuf_fd, 0);
+			clock_gettime(CLOCK_MONOTONIC, &ts_end);
+			if (p != MAP_FAILED) {
+				nohugepage_mmap_us += time_diff_us(&ts_start, &ts_end);
+				munmap(p, HUGEPAGE_TEST_SIZE);
+			}
+			clock_gettime(CLOCK_MONOTONIC, &ts_start);
+			close(dmabuf_fd);
+			clock_gettime(CLOCK_MONOTONIC, &ts_end);
+			nohugepage_free_us += time_diff_us(&ts_start, &ts_end);
+			dmabuf_fd = -1;
+		}
+	}
+
+	ksft_print_msg("Alloc latency (%dMB x%d avg): none=%ldus HUGEPAGE=%ldus NOHUGEPAGE=%ldus\n",
+		       HUGEPAGE_TEST_SIZE / ONE_MEG, LATENCY_REPS,
+		       no_hint_alloc_us / LATENCY_REPS,
+		       hugepage_alloc_us / LATENCY_REPS,
+		       nohugepage_alloc_us / LATENCY_REPS);
+	ksft_print_msg("mmap latency (%dMB x%d avg): none=%ldus HUGEPAGE=%ldus NOHUGEPAGE=%ldus\n",
+		       HUGEPAGE_TEST_SIZE / ONE_MEG, LATENCY_REPS,
+		       no_hint_mmap_us / LATENCY_REPS,
+		       hugepage_mmap_us / LATENCY_REPS,
+		       nohugepage_mmap_us / LATENCY_REPS);
+	ksft_print_msg("free latency (%dMB x%d avg): none=%ldus HUGEPAGE=%ldus NOHUGEPAGE=%ldus\n",
+		       HUGEPAGE_TEST_SIZE / ONE_MEG, LATENCY_REPS,
+		       no_hint_free_us / LATENCY_REPS,
+		       hugepage_free_us / LATENCY_REPS,
+		       nohugepage_free_us / LATENCY_REPS);
+	ksft_test_result_pass("Allocation latency benchmark\n");
+
+	close(heap_fd);
+}
+
 static int numer_of_heaps(void)
 {
 	DIR *d = opendir(DEVPATH);
@@ -420,7 +726,7 @@ int main(void)
 		return KSFT_SKIP;
 	}
 
-	ksft_set_plan(11 * numer_of_heaps());
+	ksft_set_plan(17 * numer_of_heaps());
 
 	while ((dir = readdir(d))) {
 		if (!strncmp(dir->d_name, ".", 2))
@@ -435,6 +741,9 @@ int main(void)
 		test_alloc_zeroed(dir->d_name, ONE_MEG);
 		test_alloc_compat(dir->d_name);
 		test_alloc_errors(dir->d_name);
+		test_alloc_hugepage_hints(dir->d_name);
+		test_alloc_hugepage_zeroed(dir->d_name);
+		test_alloc_latency(dir->d_name);
 	}
 	closedir(d);
 

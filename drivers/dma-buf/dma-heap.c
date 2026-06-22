@@ -113,6 +113,11 @@ static long dma_heap_ioctl_allocate(struct file *file, void *data)
 	if (heap_allocation->heap_flags & ~DMA_HEAP_VALID_HEAP_FLAGS)
 		return -EINVAL;
 
+	/* HUGEPAGE and NOHUGEPAGE are mutually exclusive hints */
+	if ((heap_allocation->heap_flags & DMA_HEAP_ALLOC_HUGEPAGE) &&
+	    (heap_allocation->heap_flags & DMA_HEAP_ALLOC_NOHUGEPAGE))
+		return -EINVAL;
+
 	fd = dma_heap_buffer_alloc(heap, heap_allocation->len,
 				   heap_allocation->fd_flags,
 				   heap_allocation->heap_flags);
