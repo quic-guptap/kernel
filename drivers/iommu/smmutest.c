@@ -8,6 +8,10 @@
 #include <linux/sizes.h>
 #include <linux/io-pgtable.h>
 #include <linux/list.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
+#include <linux/dma-mapping.h>
+#include <linux/slab.h>
 #include "arm/arm-smmu-v3/arm-smmu-v3.h"
 
 #define DRV_NAME "smmutest"
@@ -41,6 +45,27 @@ struct smmutest_map_entry {
 
 static LIST_HEAD(map_list);
 static char last_contig_test[96] = "not-run";
+
+/* atos: last IOVA queried and its translated PA */
+static dma_addr_t atos_last_iova;
+static phys_addr_t atos_last_pa;
+
+/* profiling: per-size map/unmap latency results */
+#define PROF_SIZES 3
+static const size_t prof_sizes[PROF_SIZES] = { SZ_4K, SZ_64K, SZ_2M };
+static const char * const prof_size_names[PROF_SIZES] = { "4K", "64K", "2M" };
+
+struct smmutest_prof_result {
+	u64 map_avg_ns[PROF_SIZES];
+	u64 unmap_avg_ns[PROF_SIZES];
+	u32 nr_iters;
+	bool valid;
+};
+
+static struct smmutest_prof_result last_prof;
+
+/* dma_profiling: DMA API map/unmap latency (uses flush queue when DMA_FQ) */
+static struct smmutest_prof_result last_dma_prof;
 
 static bool get_leaf_pte(struct iommu_domain *domain, dma_addr_t iova,
 			 u64 *leaf_pte, int *leaf_level);
@@ -573,11 +598,433 @@ static ssize_t run_contig_hint_test_store(struct kobject *kobj,
 	return ret ? ret : count;
 }
 
+/*
+ * atos — Address Translation Operations (software page table walk)
+ *
+ * Write an IOVA (hex) to perform iommu_iova_to_phys() and store the result.
+ * Read to retrieve the last queried IOVA and its physical address.
+ *
+ * Usage:
+ *   echo "0x1000" > /sys/kernel/smmutest/atos
+ *   cat /sys/kernel/smmutest/atos
+ *   # → iova=0x1000 pa=0xc0000000
+ *
+ * Note: requires an active iommu_map for the IOVA to return a non-zero PA.
+ */
+static ssize_t atos_store(struct kobject *kobj, struct kobj_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct iommu_domain *domain;
+	unsigned long long iova;
+	phys_addr_t pa;
+
+	if (sscanf(buf, "%llx", &iova) != 1)
+		return -EINVAL;
+
+	mutex_lock(&test_lock);
+	domain = iommu_get_domain_for_dev(&test_pdev->dev);
+	if (!domain) {
+		mutex_unlock(&test_lock);
+		return -ENODEV;
+	}
+
+	pa = iommu_iova_to_phys(domain, (dma_addr_t)iova);
+	atos_last_iova = (dma_addr_t)iova;
+	atos_last_pa = pa;
+
+	pr_info(DRV_NAME ": atos iova=0x%llx -> pa=0x%llx%s\n",
+		(unsigned long long)iova,
+		(unsigned long long)pa,
+		pa ? "" : " (not mapped)");
+
+	mutex_unlock(&test_lock);
+	return count;
+}
+
+static ssize_t atos_show(struct kobject *kobj, struct kobj_attribute *attr,
+			 char *buf)
+{
+	ssize_t n;
+
+	mutex_lock(&test_lock);
+	n = scnprintf(buf, PAGE_SIZE, "iova=0x%llx pa=0x%llx\n",
+		      (unsigned long long)atos_last_iova,
+		      (unsigned long long)atos_last_pa);
+	mutex_unlock(&test_lock);
+	return n;
+}
+
+/*
+ * profiling — iommu_map/iommu_unmap per-call latency measurement
+ *
+ * Write the number of iterations (decimal) to run the profiling loop.
+ * Read to retrieve the last profiling results as a latency table.
+ *
+ * Usage:
+ *   echo "1000" > /sys/kernel/smmutest/profiling
+ *   cat /sys/kernel/smmutest/profiling
+ *
+ * The test uses fixed IOVAs (non-overlapping, page-aligned):
+ *   4K  → IOVA 0x01000000, PA 0xc0000000
+ *   64K → IOVA 0x02000000, PA 0xc1000000
+ *   2M  → IOVA 0x04000000, PA 0xc2000000
+ */
+static ssize_t profiling_store(struct kobject *kobj, struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	static const dma_addr_t prof_iovas[PROF_SIZES] = {
+		0x01000000ULL, 0x02000000ULL, 0x04000000ULL
+	};
+	static const phys_addr_t prof_pas[PROF_SIZES] = {
+		0xc0000000ULL, 0xc1000000ULL, 0xc2000000ULL
+	};
+	struct iommu_domain *domain;
+	unsigned int nr_iters;
+	int s, i, ret;
+
+	if (kstrtouint(buf, 0, &nr_iters) || !nr_iters || nr_iters > 100000)
+		return -EINVAL;
+
+	mutex_lock(&test_lock);
+	domain = iommu_get_domain_for_dev(&test_pdev->dev);
+	if (!domain) {
+		mutex_unlock(&test_lock);
+		return -ENODEV;
+	}
+
+	memset(&last_prof, 0, sizeof(last_prof));
+	last_prof.nr_iters = nr_iters;
+
+	for (s = 0; s < PROF_SIZES; s++) {
+		u64 map_total_ns = 0, unmap_total_ns = 0;
+		dma_addr_t iova = prof_iovas[s];
+		phys_addr_t pa = prof_pas[s];
+		size_t size = prof_sizes[s];
+		int completed = 0;
+
+		for (i = 0; i < nr_iters; i++) {
+			ktime_t t;
+			size_t unmapped;
+
+			t = ktime_get();
+			ret = iommu_map(domain, iova, pa, size,
+					IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+			map_total_ns += ktime_to_ns(ktime_sub(ktime_get(), t));
+
+			if (ret) {
+				pr_err(DRV_NAME ": profiling[%s] iommu_map failed at iter %d: %d\n",
+				       prof_size_names[s], i, ret);
+				break;
+			}
+
+			t = ktime_get();
+			unmapped = iommu_unmap(domain, iova, size);
+			unmap_total_ns += ktime_to_ns(ktime_sub(ktime_get(), t));
+
+			if (unmapped != size) {
+				pr_err(DRV_NAME ": profiling[%s] iommu_unmap short at iter %d: %zu/%zu\n",
+				       prof_size_names[s], i, unmapped, size);
+				break;
+			}
+			completed++;
+		}
+
+		if (completed > 0) {
+			last_prof.map_avg_ns[s] = div_u64(map_total_ns, completed);
+			last_prof.unmap_avg_ns[s] = div_u64(unmap_total_ns, completed);
+		}
+
+		pr_info(DRV_NAME ": profiling[%s] %d iters: map_avg=%llu ns, unmap_avg=%llu ns\n",
+			prof_size_names[s], completed,
+			last_prof.map_avg_ns[s], last_prof.unmap_avg_ns[s]);
+	}
+
+	last_prof.valid = true;
+	mutex_unlock(&test_lock);
+	return count;
+}
+
+static ssize_t profiling_show(struct kobject *kobj, struct kobj_attribute *attr,
+			      char *buf)
+{
+	ssize_t used = 0;
+	int s;
+
+	mutex_lock(&test_lock);
+
+	if (!last_prof.valid) {
+		used = scnprintf(buf, PAGE_SIZE,
+				 "no profiling data — write N to run N iterations\n");
+		goto out;
+	}
+
+	used += scnprintf(buf + used, PAGE_SIZE - used,
+			  "(average over %u iterations)\n", last_prof.nr_iters);
+	used += scnprintf(buf + used, PAGE_SIZE - used,
+			  "    %4s   %12s   %12s\n",
+			  "size", "iommu_map", "iommu_unmap");
+
+	for (s = 0; s < PROF_SIZES; s++) {
+		u32 map_us_rem, unmap_us_rem;
+		u64 map_us = div_u64_rem(last_prof.map_avg_ns[s], 1000, &map_us_rem);
+		u64 unmap_us = div_u64_rem(last_prof.unmap_avg_ns[s], 1000, &unmap_us_rem);
+
+		used += scnprintf(buf + used, PAGE_SIZE - used,
+				  "    %4s   %8llu.%03u us   %8llu.%03u us\n",
+				  prof_size_names[s],
+				  map_us, map_us_rem,
+				  unmap_us, unmap_us_rem);
+	}
+out:
+	mutex_unlock(&test_lock);
+	return used;
+}
+
 static struct kobj_attribute dump_attr = __ATTR_WO(dump);
 static struct kobj_attribute state_attr = __ATTR_RO(state);
 static struct kobj_attribute iommu_map_attr = __ATTR_WO(iommu_map);
 static struct kobj_attribute iommu_unmap_attr = __ATTR_WO(iommu_unmap);
 static struct kobj_attribute run_contig_hint_test_attr = __ATTR_WO(run_contig_hint_test);
+/*
+ * dma_profiling — DMA API map/unmap latency measurement
+ *
+ * Unlike the 'profiling' entry (which uses iommu_map/iommu_unmap directly),
+ * this entry uses dma_map_single/dma_unmap_single — the full DMA API path.
+ *
+ * Key difference: dma_unmap_single() goes through iommu_dma_unmap_page()
+ * which uses the flush queue (IOMMU_DOMAIN_DMA_FQ) to defer TLB sync.
+ * With DMA_FQ enabled in arm_smmu_def_domain_type(), the unmap latency
+ * should be significantly lower than with iommu_unmap() which always syncs.
+ *
+ * Usage:
+ *   echo "1000" > /sys/kernel/smmutest/dma_profiling
+ *   cat /sys/kernel/smmutest/dma_profiling
+ */
+static ssize_t dma_profiling_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	unsigned int nr_iters;
+	int s, i;
+
+	if (kstrtouint(buf, 0, &nr_iters) || !nr_iters || nr_iters > 100000)
+		return -EINVAL;
+
+	mutex_lock(&test_lock);
+
+	memset(&last_dma_prof, 0, sizeof(last_dma_prof));
+	last_dma_prof.nr_iters = nr_iters;
+
+	for (s = 0; s < PROF_SIZES; s++) {
+		u64 map_total_ns = 0, unmap_total_ns = 0;
+		size_t size = prof_sizes[s];
+		int completed = 0;
+		void *buf_virt;
+
+		buf_virt = kmalloc(size, GFP_KERNEL);
+		if (!buf_virt) {
+			pr_err(DRV_NAME ": dma_profiling[%s] kmalloc failed\n",
+			       prof_size_names[s]);
+			break;
+		}
+
+		for (i = 0; i < nr_iters; i++) {
+			ktime_t t;
+			dma_addr_t dma_addr;
+
+			t = ktime_get();
+			dma_addr = dma_map_single(&test_pdev->dev, buf_virt,
+						  size, DMA_TO_DEVICE);
+			map_total_ns += ktime_to_ns(ktime_sub(ktime_get(), t));
+
+			if (dma_mapping_error(&test_pdev->dev, dma_addr)) {
+				pr_err(DRV_NAME ": dma_profiling[%s] dma_map_single failed at iter %d\n",
+				       prof_size_names[s], i);
+				break;
+			}
+
+			t = ktime_get();
+			dma_unmap_single(&test_pdev->dev, dma_addr, size,
+					 DMA_TO_DEVICE);
+			unmap_total_ns += ktime_to_ns(ktime_sub(ktime_get(), t));
+
+			completed++;
+		}
+
+		kfree(buf_virt);
+
+		if (completed > 0) {
+			last_dma_prof.map_avg_ns[s] = div_u64(map_total_ns, completed);
+			last_dma_prof.unmap_avg_ns[s] = div_u64(unmap_total_ns, completed);
+		}
+
+		pr_info(DRV_NAME ": dma_profiling[%s] %d iters: map_avg=%llu ns, unmap_avg=%llu ns\n",
+			prof_size_names[s], completed,
+			last_dma_prof.map_avg_ns[s], last_dma_prof.unmap_avg_ns[s]);
+	}
+
+	last_dma_prof.valid = true;
+	mutex_unlock(&test_lock);
+	return count;
+}
+
+static ssize_t dma_profiling_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	ssize_t used = 0;
+	int s;
+
+	mutex_lock(&test_lock);
+
+	if (!last_dma_prof.valid) {
+		used = scnprintf(buf, PAGE_SIZE,
+				 "no dma_profiling data — write N to run N iterations\n");
+		goto out;
+	}
+
+	used += scnprintf(buf + used, PAGE_SIZE - used,
+			  "(DMA API, average over %u iterations)\n",
+			  last_dma_prof.nr_iters);
+	used += scnprintf(buf + used, PAGE_SIZE - used,
+			  "    %4s   %12s   %12s\n",
+			  "size", "dma_map", "dma_unmap");
+
+	for (s = 0; s < PROF_SIZES; s++) {
+		u32 map_us_rem, unmap_us_rem;
+		u64 map_us = div_u64_rem(last_dma_prof.map_avg_ns[s], 1000, &map_us_rem);
+		u64 unmap_us = div_u64_rem(last_dma_prof.unmap_avg_ns[s], 1000, &unmap_us_rem);
+
+		used += scnprintf(buf + used, PAGE_SIZE - used,
+				  "    %4s   %8llu.%03u us   %8llu.%03u us\n",
+				  prof_size_names[s],
+				  map_us, map_us_rem,
+				  unmap_us, unmap_us_rem);
+	}
+out:
+	mutex_unlock(&test_lock);
+	return used;
+}
+
+/*
+ * profiling_compare — comprehensive per-function DMA latency breakdown
+ *
+ * Ports Dusa's ktime instrumentation approach (from fastmap-kpi-regression)
+ * to the upstream kernel. Measures per-function latency across the full
+ * DMA API stack: dma_map, IOVA alloc, iommu_map, alloc_pgt, install_table,
+ * iommu_unmap, tlb_sync, free_iova.
+ *
+ * Usage:
+ *   echo "1000" > /sys/kernel/smmutest/profiling_compare
+ *   cat /sys/kernel/smmutest/profiling_compare
+ *
+ * Output shows per-function avg latency for 4K DMA map/unmap, enabling
+ * side-by-side comparison of strict vs DMA_FQ vs fastmap modes.
+ */
+static struct iommu_prof_stats last_compare_stats;
+static u32 last_compare_iters;
+
+static ssize_t profiling_compare_store(struct kobject *kobj,
+				       struct kobj_attribute *attr,
+				       const char *buf, size_t count)
+{
+	unsigned int nr_iters;
+	int i;
+	void *buf_virt;
+
+	if (kstrtouint(buf, 0, &nr_iters) || !nr_iters || nr_iters > 100000)
+		return -EINVAL;
+
+	buf_virt = kmalloc(SZ_4K, GFP_KERNEL);
+	if (!buf_virt)
+		return -ENOMEM;
+
+	mutex_lock(&test_lock);
+
+	/* Reset and enable profiling */
+	memset(&iommu_prof_stats, 0, sizeof(iommu_prof_stats));
+	iommu_prof_enabled = true;
+
+	for (i = 0; i < nr_iters; i++) {
+		dma_addr_t dma_addr;
+
+		dma_addr = dma_map_single(&test_pdev->dev, buf_virt,
+					  SZ_4K, DMA_TO_DEVICE);
+		if (dma_mapping_error(&test_pdev->dev, dma_addr)) {
+			pr_err(DRV_NAME ": profiling_compare dma_map_single failed at iter %d\n", i);
+			break;
+		}
+		dma_unmap_single(&test_pdev->dev, dma_addr, SZ_4K, DMA_TO_DEVICE);
+	}
+
+	iommu_prof_enabled = false;
+	last_compare_stats = iommu_prof_stats;
+	last_compare_iters = i;
+
+	mutex_unlock(&test_lock);
+	kfree(buf_virt);
+	return count;
+}
+
+static ssize_t profiling_compare_show(struct kobject *kobj,
+				      struct kobj_attribute *attr, char *buf)
+{
+	ssize_t used = 0;
+	u32 n;
+
+	mutex_lock(&test_lock);
+	n = last_compare_iters;
+
+	if (!n) {
+		used = scnprintf(buf, PAGE_SIZE,
+				 "no data — write N to run N iterations\n");
+		goto out;
+	}
+
+#define PSTAT(label, field) do {					\
+	const struct iommu_func_stats *_s = &last_compare_stats.field;	\
+	u32 _avg_rem;							\
+	u64 _avg_ns = _s->count ? div_u64(_s->total_ns, _s->count) : 0;\
+	u64 _avg_us = div_u64_rem(_avg_ns, 1000, &_avg_rem);		\
+	used += scnprintf(buf + used, PAGE_SIZE - used,			\
+		"  %-32s Total: %llu ns  Count: %llu  Avg: %llu.%03u us\n",\
+		label, _s->total_ns, _s->count, _avg_us, _avg_rem);	\
+} while (0)
+
+	used += scnprintf(buf + used, PAGE_SIZE - used,
+			  "profiling_compare: 4K DMA map/unmap, %u iterations\n"
+			  "  (iommu_prof_enabled instrumentation)\n"
+			  "  (for full histogram: cat /sys/kernel/debug/iommu/profiling/stats)\n\n",
+			  n);
+
+	used += scnprintf(buf + used, PAGE_SIZE - used,
+			  "--- MAP path ---\n");
+	PSTAT("dma_map_phys (top):",      dma_map);
+	PSTAT("__iommu_dma_map (inner):", __dma_map);
+	PSTAT("alloc_iova:",              alloc_iova);
+	PSTAT("iommu_map:",               iommu_map);
+	PSTAT("iommu_sync_map:",          iommu_sync_map);
+	PSTAT("alloc_pgt:",               alloc_pgt);
+	PSTAT("install_table:",           install_table);
+
+	used += scnprintf(buf + used, PAGE_SIZE - used,
+			  "\n--- UNMAP path ---\n");
+	PSTAT("dma_unmap_phys (top):",      dma_unmap);
+	PSTAT("__iommu_dma_unmap (inner):", __dma_unmap);
+	PSTAT("iommu_unmap_fast:",          iommu_unmap);
+	PSTAT("iommu_iotlb_sync (TLB):",    tlb_sync);
+	PSTAT("free_iova:",                 free_iova);
+	PSTAT("iova_to_phys:",              iova_to_phys);
+#undef PSTAT
+
+out:
+	mutex_unlock(&test_lock);
+	return used;
+}
+
+static struct kobj_attribute atos_attr = __ATTR_RW(atos);
+static struct kobj_attribute profiling_attr = __ATTR_RW(profiling);
+static struct kobj_attribute dma_profiling_attr = __ATTR_RW(dma_profiling);
+static struct kobj_attribute profiling_compare_attr = __ATTR_RW(profiling_compare);
 
 static struct attribute *smmu_attrs[] = {
 	&dump_attr.attr,
@@ -585,6 +1032,10 @@ static struct attribute *smmu_attrs[] = {
 	&iommu_unmap_attr.attr,
 	&run_contig_hint_test_attr.attr,
 	&state_attr.attr,
+	&atos_attr.attr,
+	&profiling_attr.attr,
+	&dma_profiling_attr.attr,
+	&profiling_compare_attr.attr,
 	NULL,
 };
 
