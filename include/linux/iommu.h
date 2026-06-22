@@ -216,9 +216,20 @@ enum iommu_domain_cookie_type {
 #define IOMMU_DOMAIN_DMA_FQ	(__IOMMU_DOMAIN_PAGING |	\
 				 __IOMMU_DOMAIN_DMA_API |	\
 				 __IOMMU_DOMAIN_DMA_FQ)
+/*
+ * IOMMU_DOMAIN_DMA_FAST: Fastmap-style domain using per-CPU bitmap IOVA
+ * allocator + deferred TLB (DMA_FQ). Eliminates the red-black tree IOVA
+ * allocator bottleneck. Enable via arm-smmu-v3 debugfs fast_mode entry.
+ */
+#define IOMMU_DOMAIN_DMA_FAST	(__IOMMU_DOMAIN_PAGING |	\
+				 __IOMMU_DOMAIN_DMA_API |	\
+				 __IOMMU_DOMAIN_DMA_FQ)
 #define IOMMU_DOMAIN_SVA	(__IOMMU_DOMAIN_SVA)
 #define IOMMU_DOMAIN_PLATFORM	(__IOMMU_DOMAIN_PLATFORM)
 #define IOMMU_DOMAIN_NESTED	(__IOMMU_DOMAIN_NESTED)
+
+/* Flag to distinguish DMA_FAST from DMA_FQ at runtime */
+#define IOMMU_DOMAIN_DMA_FAST_FLAG	BIT(31)
 
 struct iommu_domain {
 	unsigned type;
@@ -971,6 +982,106 @@ int iommu_set_pgtable_quirks(struct iommu_domain *domain,
 
 void iommu_set_dma_strict(void);
 
+/**
+ * struct iommu_func_stats - per-function latency statistics
+ *
+ * Stores count, total, min, max, and a log2 histogram (in µs buckets)
+ * for a single instrumented function. Designed for live monitoring:
+ * read via debugfs clears atomically, giving per-interval snapshots.
+ *
+ * Histogram buckets (hist[i]):
+ *   [0]  < 1 µs
+ *   [1]  1–2 µs
+ *   [2]  2–4 µs
+ *   [3]  4–8 µs
+ *   [4]  8–16 µs
+ *   [5]  16–32 µs
+ *   [6]  32–64 µs
+ *   [7]  64–128 µs
+ *   [8]  128–256 µs
+ *   [9]  256–512 µs
+ *   [10] 512 µs–1 ms
+ *   [11] 1–2 ms
+ *   [12] 2–4 ms
+ *   [13] 4–8 ms
+ *   [14] 8–16 ms
+ *   [15] ≥ 16 ms
+ */
+struct iommu_func_stats {
+	u64 count;
+	u64 total_ns;
+	u64 min_ns;
+	u64 max_ns;
+	u64 hist[16];
+};
+
+/**
+ * struct iommu_prof_stats - per-function profiling stats for the DMA/IOMMU stack
+ *
+ * Covers the full path from dma_map_single() down to page table operations
+ * and TLB invalidation. Enabled via iommu_prof_enabled; exposed through
+ * /sys/kernel/debug/iommu/profiling/ with clear-on-read semantics.
+ *
+ * Usage for live Ethernet profiling:
+ *   echo 1 > /sys/kernel/debug/iommu/profiling/enable
+ *   # run iperf3 ...
+ *   cat /sys/kernel/debug/iommu/profiling/stats   # clears on read
+ *   echo 0 > /sys/kernel/debug/iommu/profiling/enable
+ */
+struct iommu_prof_stats {
+	/* DMA API top-level */
+	struct iommu_func_stats dma_map;
+	struct iommu_func_stats dma_unmap;
+	/* Inner DMA map/unmap */
+	struct iommu_func_stats __dma_map;
+	struct iommu_func_stats __dma_unmap;
+	/* IOVA allocator */
+	struct iommu_func_stats alloc_iova;
+	struct iommu_func_stats free_iova;
+	/* IOMMU interface */
+	struct iommu_func_stats iommu_map;
+	struct iommu_func_stats iommu_sync_map;
+	struct iommu_func_stats iommu_unmap;
+	/* TLB sync (iommu_iotlb_sync inline → arm_smmu_iotlb_sync) */
+	struct iommu_func_stats tlb_sync;
+	/* Page table operations */
+	struct iommu_func_stats alloc_pgt;
+	struct iommu_func_stats install_table;
+	/* iova_to_phys */
+	struct iommu_func_stats iova_to_phys;
+};
+
+extern struct iommu_prof_stats iommu_prof_stats;
+extern bool iommu_prof_enabled;
+extern spinlock_t iommu_prof_lock;
+
+/* Bitmap IOVA allocator (fastmap-style O(1)) — enable via debugfs */
+extern bool iommu_bitmap_alloc_enabled;
+
+/* Per-CPU fastmap IOVA allocator — enable via arm-smmu-v3 debugfs fast_mode */
+extern bool iommu_fast_mode_enabled;
+
+/**
+ * iommu_prof_record - record one latency sample into a func_stats bucket
+ * @s:  pointer to the iommu_func_stats to update
+ * @ns: elapsed nanoseconds for this call
+ *
+ * Updates count, total, min, max, and the log2-µs histogram.
+ * Caller must hold iommu_prof_lock or accept best-effort accuracy.
+ */
+static inline void iommu_prof_record(struct iommu_func_stats *s, u64 ns)
+{
+	u64 bucket = (ns >= 1000) ? min_t(u64, ilog2(ns / 1000), 15) : 0;
+
+	if (!s->count || ns < s->min_ns)
+		s->min_ns = ns;
+	if (ns > s->max_ns)
+		s->max_ns = ns;
+	s->total_ns += ns;
+	s->count++;
+	s->hist[bucket]++;
+}
+
 extern int report_iommu_fault(struct iommu_domain *domain, struct device *dev,
 			      unsigned long iova, int flags);
 
@@ -984,8 +1095,16 @@ static inline void iommu_iotlb_sync(struct iommu_domain *domain,
 				  struct iommu_iotlb_gather *iotlb_gather)
 {
 	if (domain->ops->iotlb_sync &&
-	    likely(iotlb_gather->start < iotlb_gather->end))
-		domain->ops->iotlb_sync(domain, iotlb_gather);
+	    likely(iotlb_gather->start < iotlb_gather->end)) {
+		if (unlikely(iommu_prof_enabled)) {
+			ktime_t _t = ktime_get();
+			domain->ops->iotlb_sync(domain, iotlb_gather);
+			iommu_prof_record(&iommu_prof_stats.tlb_sync,
+				ktime_to_ns(ktime_sub(ktime_get(), _t)));
+		} else {
+			domain->ops->iotlb_sync(domain, iotlb_gather);
+		}
+	}
 
 	iommu_iotlb_gather_init(iotlb_gather);
 }

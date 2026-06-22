@@ -63,6 +63,18 @@ config IOMMU_SMMUTEST
 	    dump                   - W: "1" or "<iova_hex> <size_hex>"
 	    run_contig_hint_test   - W: "1"
 	    state                  - R: current mapping and test status
+	    atos                   - RW: W: "<iova_hex>", R: "iova=X pa=Y"
+	                             Performs iommu_iova_to_phys() (software
+	                             page table walk) on the given IOVA and
+	                             returns the translated physical address.
+	                             Upstream equivalent of QCOM ATOS debugfs.
+	    profiling              - RW: W: "<nr_iters>", R: latency table
+	                             Runs N iterations of iommu_map/iommu_unmap
+	                             at 4K, 64K, and 2M sizes, measuring per-call
+	                             latency with ktime_get(). Reports average
+	                             map and unmap latency in microseconds.
+	                             Useful for measuring upstream lazy DMA path
+	                             baseline (FR204703 / CR 4504475).
 
 	  If unsure, say N here.
 

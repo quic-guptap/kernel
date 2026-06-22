@@ -38,6 +38,18 @@
 
 #include "dma-iommu.h"
 #include "iommu-priv.h"
+#include <linux/ktime.h>
+
+/* Profiling globals — exported for iommu-profiling.c debugfs interface */
+struct iommu_prof_stats iommu_prof_stats;
+EXPORT_SYMBOL_GPL(iommu_prof_stats);
+
+bool iommu_prof_enabled;
+EXPORT_SYMBOL_GPL(iommu_prof_enabled);
+
+/* Protects stats snapshot/clear in iommu-profiling.c read handler */
+DEFINE_SPINLOCK(iommu_prof_lock);
+EXPORT_SYMBOL_GPL(iommu_prof_lock);
 
 static struct kset *iommu_group_kset;
 static DEFINE_IDA(iommu_group_ida);
@@ -2547,13 +2559,21 @@ EXPORT_SYMBOL_GPL(iommu_detach_group);
 
 phys_addr_t iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
 {
+	phys_addr_t ret;
+	ktime_t _t;
+
 	if (domain->type == IOMMU_DOMAIN_IDENTITY)
 		return iova;
 
 	if (domain->type == IOMMU_DOMAIN_BLOCKED)
 		return 0;
 
-	return domain->ops->iova_to_phys(domain, iova);
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
+	ret = domain->ops->iova_to_phys(domain, iova);
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.iova_to_phys,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
+	return ret;
 }
 EXPORT_SYMBOL_GPL(iommu_iova_to_phys);
 
@@ -2668,10 +2688,17 @@ static int __iommu_map_domain_pgtbl(struct iommu_domain *domain,
 int iommu_sync_map(struct iommu_domain *domain, unsigned long iova, size_t size)
 {
 	const struct iommu_domain_ops *ops = domain->ops;
+	int ret;
+	ktime_t _t;
 
 	if (!ops->iotlb_sync_map)
 		return 0;
-	return ops->iotlb_sync_map(domain, iova, size);
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
+	ret = ops->iotlb_sync_map(domain, iova, size);
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.iommu_sync_map,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
+	return ret;
 }
 
 int iommu_map_nosync(struct iommu_domain *domain, unsigned long iova,
@@ -2710,15 +2737,24 @@ int iommu_map(struct iommu_domain *domain, unsigned long iova,
 	      phys_addr_t paddr, size_t size, int prot, gfp_t gfp)
 {
 	int ret;
+	ktime_t _t;
 
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
 	ret = iommu_map_nosync(domain, iova, paddr, size, prot, gfp);
-	if (ret)
+	if (ret) {
+		if (unlikely(iommu_prof_enabled))
+			iommu_prof_record(&iommu_prof_stats.iommu_map,
+				ktime_to_ns(ktime_sub(ktime_get(), _t)));
 		return ret;
+	}
 
 	ret = iommu_sync_map(domain, iova, size);
 	if (ret)
 		iommu_unmap(domain, iova, size);
 
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.iommu_map,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
 	return ret;
 }
 EXPORT_SYMBOL_GPL(iommu_map);
@@ -2852,7 +2888,15 @@ size_t iommu_unmap_fast(struct iommu_domain *domain,
 			unsigned long iova, size_t size,
 			struct iommu_iotlb_gather *iotlb_gather)
 {
-	return __iommu_unmap(domain, iova, size, iotlb_gather);
+	size_t ret;
+	ktime_t _t;
+
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
+	ret = __iommu_unmap(domain, iova, size, iotlb_gather);
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.iommu_unmap,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
+	return ret;
 }
 EXPORT_SYMBOL_GPL(iommu_unmap_fast);
 

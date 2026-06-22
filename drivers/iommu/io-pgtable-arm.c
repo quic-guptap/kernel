@@ -256,7 +256,9 @@ static void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp,
 	size_t alloc_size;
 	dma_addr_t dma;
 	void *pages;
+	ktime_t _t;
 
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
 	/*
 	 * For very small starting-level translation tables the HW requires a
 	 * minimum alignment of at least 64 to cover all cases.
@@ -268,8 +270,12 @@ static void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp,
 		pages = iommu_alloc_pages_node_sz(dev_to_node(dev), gfp,
 						  alloc_size);
 
-	if (!pages)
+	if (!pages) {
+		if (unlikely(iommu_prof_enabled))
+			iommu_prof_record(&iommu_prof_stats.alloc_pgt,
+				ktime_to_ns(ktime_sub(ktime_get(), _t)));
 		return NULL;
+	}
 
 	if (!cfg->coherent_walk) {
 		dma = dma_map_single(dev, pages, size, DMA_TO_DEVICE);
@@ -284,6 +290,9 @@ static void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp,
 			goto out_unmap;
 	}
 
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.alloc_pgt,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
 	return pages;
 
 out_unmap:
@@ -296,6 +305,9 @@ out_free:
 	else
 		iommu_free_pages(pages);
 
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.alloc_pgt,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
 	return NULL;
 }
 
@@ -394,7 +406,9 @@ static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
 {
 	arm_lpae_iopte old, new;
 	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+	ktime_t _t;
 
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
 	new = paddr_to_iopte(__pa(table), data) | ARM_LPAE_PTE_TYPE_TABLE;
 	if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_NS)
 		new |= ARM_LPAE_PTE_NSTABLE;
@@ -408,14 +422,21 @@ static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
 
 	old = cmpxchg64_relaxed(ptep, curr, new);
 
-	if (cfg->coherent_walk || (old & ARM_LPAE_PTE_SW_SYNC))
+	if (cfg->coherent_walk || (old & ARM_LPAE_PTE_SW_SYNC)) {
+		if (unlikely(iommu_prof_enabled))
+			iommu_prof_record(&iommu_prof_stats.install_table,
+				ktime_to_ns(ktime_sub(ktime_get(), _t)));
 		return old;
+	}
 
 	/* Even if it's not ours, there's no point waiting; just kick it */
 	__arm_lpae_sync_pte(ptep, 1, cfg);
 	if (old == curr)
 		WRITE_ONCE(*ptep, new | ARM_LPAE_PTE_SW_SYNC);
 
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.install_table,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
 	return old;
 }
 
