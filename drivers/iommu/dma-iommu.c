@@ -37,6 +37,7 @@
 
 #include "dma-iommu.h"
 #include "iommu-pages.h"
+#include <linux/ktime.h>
 
 struct iommu_dma_msi_page {
 	struct list_head	list;
@@ -763,11 +764,14 @@ static dma_addr_t iommu_dma_alloc_iova(struct iommu_domain *domain,
 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
 	struct iova_domain *iovad = &cookie->iovad;
 	unsigned long shift, iova_len, iova;
+	ktime_t _t;
 
 	if (domain->cookie_type == IOMMU_COOKIE_DMA_MSI) {
 		domain->msi_cookie->msi_iova += size;
 		return domain->msi_cookie->msi_iova - size;
 	}
+
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
 
 	shift = iova_shift(iovad);
 	iova_len = size >> shift;
@@ -800,24 +804,34 @@ static dma_addr_t iommu_dma_alloc_iova(struct iommu_domain *domain,
 
 	iova = alloc_iova_fast(iovad, iova_len, dma_limit >> shift, true);
 done:
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.alloc_iova,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
 	return (dma_addr_t)iova << shift;
 }
 
 static void iommu_dma_free_iova(struct iommu_domain *domain, dma_addr_t iova,
 				size_t size, struct iommu_iotlb_gather *gather)
 {
-	struct iova_domain *iovad = &domain->iova_cookie->iovad;
+	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+	struct iova_domain *iovad = &cookie->iovad;
+	ktime_t _t;
 
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
 	/* The MSI case is only ever cleaning up its most recent allocation */
-	if (domain->cookie_type == IOMMU_COOKIE_DMA_MSI)
+	if (domain->cookie_type == IOMMU_COOKIE_DMA_MSI) {
 		domain->msi_cookie->msi_iova -= size;
-	else if (gather && gather->queued)
-		queue_iova(domain->iova_cookie, iova_pfn(iovad, iova),
+	} else if (gather && gather->queued) {
+		queue_iova(cookie, iova_pfn(iovad, iova),
 				size >> iova_shift(iovad),
 				&gather->freelist);
-	else
+	} else {
 		free_iova_fast(iovad, iova_pfn(iovad, iova),
 				size >> iova_shift(iovad));
+	}
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.free_iova,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
 }
 
 static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
@@ -829,7 +843,9 @@ static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
 	size_t iova_off = iova_offset(iovad, dma_addr);
 	struct iommu_iotlb_gather iotlb_gather;
 	size_t unmapped;
+	ktime_t _t;
 
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
 	dma_addr -= iova_off;
 	size = iova_align(iovad, size + iova_off);
 	iommu_iotlb_gather_init(&iotlb_gather);
@@ -841,6 +857,9 @@ static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
 	if (!iotlb_gather.queued)
 		iommu_iotlb_sync(domain, &iotlb_gather);
 	iommu_dma_free_iova(domain, dma_addr, size, &iotlb_gather);
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.__dma_unmap,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
 }
 
 static dma_addr_t __iommu_dma_map(struct device *dev, phys_addr_t phys,
@@ -851,6 +870,7 @@ static dma_addr_t __iommu_dma_map(struct device *dev, phys_addr_t phys,
 	struct iova_domain *iovad = &cookie->iovad;
 	size_t iova_off = iova_offset(iovad, phys);
 	dma_addr_t iova;
+	ktime_t _t;
 
 	if (static_branch_unlikely(&iommu_deferred_attach_enabled) &&
 	    iommu_deferred_attach(dev, domain))
@@ -861,16 +881,27 @@ static dma_addr_t __iommu_dma_map(struct device *dev, phys_addr_t phys,
 	    "Unsupported alignment constraint\n"))
 		return DMA_MAPPING_ERROR;
 
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
 	size = iova_align(iovad, size + iova_off);
 
 	iova = iommu_dma_alloc_iova(domain, size, dma_mask, dev);
-	if (!iova)
+	if (!iova) {
+		if (unlikely(iommu_prof_enabled))
+			iommu_prof_record(&iommu_prof_stats.__dma_map,
+				ktime_to_ns(ktime_sub(ktime_get(), _t)));
 		return DMA_MAPPING_ERROR;
+	}
 
 	if (iommu_map(domain, iova, phys - iova_off, size, prot, GFP_ATOMIC)) {
 		iommu_dma_free_iova(domain, iova, size, NULL);
+		if (unlikely(iommu_prof_enabled))
+			iommu_prof_record(&iommu_prof_stats.__dma_map,
+				ktime_to_ns(ktime_sub(ktime_get(), _t)));
 		return DMA_MAPPING_ERROR;
 	}
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.__dma_map,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
 	return iova + iova_off;
 }
 
@@ -1223,6 +1254,9 @@ dma_addr_t iommu_dma_map_phys(struct device *dev, phys_addr_t phys, size_t size,
 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
 	struct iova_domain *iovad = &cookie->iovad;
 	dma_addr_t iova, dma_mask = dma_get_mask(dev);
+	ktime_t _t;
+
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
 
 	/*
 	 * If both the physical buffer start address and size are page aligned,
@@ -1247,6 +1281,9 @@ dma_addr_t iommu_dma_map_phys(struct device *dev, phys_addr_t phys, size_t size,
 	if (iova == DMA_MAPPING_ERROR &&
 	    !(attrs & (DMA_ATTR_MMIO | DMA_ATTR_REQUIRE_COHERENT)))
 		swiotlb_tbl_unmap_single(dev, phys, size, dir, attrs);
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.dma_map,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
 	return iova;
 }
 
@@ -1254,9 +1291,15 @@ void iommu_dma_unmap_phys(struct device *dev, dma_addr_t dma_handle,
 		size_t size, enum dma_data_direction dir, unsigned long attrs)
 {
 	phys_addr_t phys;
+	ktime_t _t;
+
+	if (unlikely(iommu_prof_enabled)) _t = ktime_get();
 
 	if (attrs & (DMA_ATTR_MMIO | DMA_ATTR_REQUIRE_COHERENT)) {
 		__iommu_dma_unmap(dev, dma_handle, size);
+		if (unlikely(iommu_prof_enabled))
+			iommu_prof_record(&iommu_prof_stats.dma_unmap,
+				ktime_to_ns(ktime_sub(ktime_get(), _t)));
 		return;
 	}
 
@@ -1272,6 +1315,9 @@ void iommu_dma_unmap_phys(struct device *dev, dma_addr_t dma_handle,
 	__iommu_dma_unmap(dev, dma_handle, size);
 
 	swiotlb_tbl_unmap_single(dev, phys, size, dir, attrs);
+	if (unlikely(iommu_prof_enabled))
+		iommu_prof_record(&iommu_prof_stats.dma_unmap,
+			ktime_to_ns(ktime_sub(ktime_get(), _t)));
 }
 
 /*
