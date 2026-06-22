@@ -55,6 +55,57 @@ struct iommu_dma_options {
 	unsigned int	fq_timeout;
 };
 
+/**
+ * struct iommu_dma_bitmap - Fastmap-style O(1) IOVA allocator
+ *
+ * Replaces the red-black tree with a flat bitmap for fixed-size (granule)
+ * IOVA allocations. Allocation is find_next_zero_bit() + set_bit() — O(n/64)
+ * but effectively O(1) with the next-fit hint. Free is clear_bit() — O(1).
+ *
+ * For a 256MB IOVA space with 4K granule: 65536 bits = 8KB bitmap.
+ * Enabled via /sys/kernel/debug/iommu/profiling/bitmap_alloc.
+ */
+struct iommu_dma_bitmap {
+	unsigned long *bitmap;   /* flat bitmap, 1 bit per granule */
+	unsigned long nbits;     /* total bits = IOVA space / granule */
+	unsigned long hint;      /* next-fit hint for find_next_zero_bit */
+	dma_addr_t    base;      /* base IOVA address */
+	unsigned long shift;     /* iova_shift(iovad) */
+	spinlock_t    lock;
+};
+
+/* Global flag: use bitmap IOVA allocator instead of red-black tree */
+bool iommu_bitmap_alloc_enabled __read_mostly;
+EXPORT_SYMBOL_GPL(iommu_bitmap_alloc_enabled);
+
+/*
+ * Per-CPU fastmap IOVA allocator — KP5.0 fastmap port to upstream.
+ * Partitions IOVA space into per-CPU slices. Each CPU has its own bitmap
+ * with no spinlock. alloc: find_next_zero_bit (per-CPU, no lock).
+ * free: atomic clear_bit (safe from any CPU).
+ * Enable via: echo 1 > /sys/kernel/debug/iommu/profiling/fast_mode
+ */
+bool iommu_fast_mode_enabled __read_mostly;
+EXPORT_SYMBOL_GPL(iommu_fast_mode_enabled);
+
+#define IOMMU_FAST_IOVA_SIZE    (256UL * 1024 * 1024)  /* 256MB per-CPU region */
+
+struct iommu_dma_percpu_bm {
+	unsigned long *bitmap;
+	unsigned long nbits;
+	unsigned long hint;
+	dma_addr_t    base;
+};
+
+struct iommu_dma_fast {
+	struct iommu_dma_percpu_bm __percpu *bm;
+	dma_addr_t    base;
+	unsigned long shift;
+	unsigned long nbits_per_cpu;
+	int           ncpus;
+	bool          valid;
+};
+
 struct iommu_dma_cookie {
 	struct iova_domain iovad;
 	struct list_head msi_page_list;
@@ -75,7 +126,164 @@ struct iommu_dma_cookie {
 	struct iommu_domain *fq_domain;
 	/* Options for dma-iommu use */
 	struct iommu_dma_options options;
+	/* Bitmap IOVA allocator (fastmap-style, global spinlock) */
+	struct iommu_dma_bitmap bm;
+	bool bm_valid;
+	/* Per-CPU fastmap IOVA allocator (KP5.0 port, no spinlock) */
+	struct iommu_dma_fast fast;
 };
+
+static dma_addr_t iommu_dma_fast_alloc_iova(struct iommu_dma_fast *f,
+					     size_t size)
+{
+	struct iommu_dma_percpu_bm *bm;
+	unsigned long bit;
+	dma_addr_t iova;
+
+	if (size != (1UL << f->shift))
+		return 0;
+
+	bm = get_cpu_ptr(f->bm);
+	bit = find_next_zero_bit(bm->bitmap, bm->nbits, bm->hint);
+	if (bit >= bm->nbits)
+		bit = find_first_zero_bit(bm->bitmap, bm->nbits);
+	if (bit >= bm->nbits) {
+		put_cpu_ptr(f->bm);
+		return 0;
+	}
+	set_bit(bit, bm->bitmap);
+	bm->hint = bit + 1;
+	if (bm->hint >= bm->nbits)
+		bm->hint = 0;
+	iova = bm->base + ((dma_addr_t)bit << f->shift);
+	put_cpu_ptr(f->bm);
+	return iova;
+}
+
+static void iommu_dma_fast_free_iova(struct iommu_dma_fast *f,
+				      dma_addr_t iova, size_t size)
+{
+	int cpu;
+	struct iommu_dma_percpu_bm *bm;
+	unsigned long bit;
+
+	cpu = (int)div_u64(iova - f->base, (u64)f->nbits_per_cpu << f->shift);
+	if (cpu < 0 || cpu >= f->ncpus)
+		return;
+	bm = per_cpu_ptr(f->bm, cpu);
+	bit = (iova - bm->base) >> f->shift;
+	if (bit < bm->nbits)
+		clear_bit(bit, bm->bitmap);
+}
+
+static int iommu_dma_fast_init(struct iommu_dma_fast *f, dma_addr_t base,
+			        unsigned long shift)
+{
+	unsigned long total_bits, bits_per_cpu;
+	int cpu, ncpus = num_possible_cpus();
+
+	total_bits = IOMMU_FAST_IOVA_SIZE >> shift;
+	bits_per_cpu = total_bits / ncpus;
+	if (!bits_per_cpu)
+		return -EINVAL;
+
+	f->bm = alloc_percpu(struct iommu_dma_percpu_bm);
+	if (!f->bm)
+		return -ENOMEM;
+
+	f->base = base;
+	f->shift = shift;
+	f->nbits_per_cpu = bits_per_cpu;
+	f->ncpus = ncpus;
+
+	for_each_possible_cpu(cpu) {
+		struct iommu_dma_percpu_bm *bm = per_cpu_ptr(f->bm, cpu);
+
+		bm->nbits = bits_per_cpu;
+		bm->hint  = 0;
+		bm->base  = base + (dma_addr_t)cpu * (bits_per_cpu << shift);
+		bm->bitmap = kzalloc(BITS_TO_LONGS(bits_per_cpu) *
+				     sizeof(unsigned long), GFP_KERNEL);
+		if (!bm->bitmap)
+			goto err_free;
+	}
+	f->valid = true;
+	pr_info("iommu: fastmap per-CPU bitmap: %lu bits/CPU × %d CPUs, base=0x%llx\n",
+		bits_per_cpu, ncpus, (unsigned long long)base);
+	return 0;
+
+err_free:
+	for_each_possible_cpu(cpu) {
+		struct iommu_dma_percpu_bm *bm = per_cpu_ptr(f->bm, cpu);
+		kfree(bm->bitmap);
+		bm->bitmap = NULL;
+	}
+	free_percpu(f->bm);
+	f->bm = NULL;
+	return -ENOMEM;
+}
+
+static void iommu_dma_fast_destroy(struct iommu_dma_fast *f)
+{
+	int cpu;
+
+	if (!f->valid)
+		return;
+	for_each_possible_cpu(cpu) {
+		struct iommu_dma_percpu_bm *bm = per_cpu_ptr(f->bm, cpu);
+		kfree(bm->bitmap);
+		bm->bitmap = NULL;
+	}
+	free_percpu(f->bm);
+	f->bm = NULL;
+	f->valid = false;
+}
+
+static dma_addr_t iommu_dma_bitmap_alloc(struct iommu_dma_bitmap *bm,
+					  size_t size)
+{
+	unsigned long bit, nbits_needed;
+	unsigned long flags;
+
+	/* Only handle single-granule allocations */
+	nbits_needed = size >> bm->shift;
+	if (nbits_needed != 1)
+		return 0;
+
+	spin_lock_irqsave(&bm->lock, flags);
+	/* Next-fit search from hint */
+	bit = find_next_zero_bit(bm->bitmap, bm->nbits, bm->hint);
+	if (bit >= bm->nbits) {
+		/* Wrap around to beginning */
+		bit = find_first_zero_bit(bm->bitmap, bm->nbits);
+		if (bit >= bm->nbits) {
+			spin_unlock_irqrestore(&bm->lock, flags);
+			return 0; /* bitmap full — fall back to tree */
+		}
+	}
+	set_bit(bit, bm->bitmap);
+	bm->hint = bit + 1;
+	if (bm->hint >= bm->nbits)
+		bm->hint = 0;
+	spin_unlock_irqrestore(&bm->lock, flags);
+
+	return bm->base + ((dma_addr_t)bit << bm->shift);
+}
+
+static void iommu_dma_bitmap_free(struct iommu_dma_bitmap *bm,
+				   dma_addr_t iova, size_t size)
+{
+	unsigned long bit;
+	unsigned long flags;
+
+	bit = (iova - bm->base) >> bm->shift;
+	spin_lock_irqsave(&bm->lock, flags);
+	clear_bit(bit, bm->bitmap);
+	/* Update hint for next allocation (next-fit) */
+	if (bit < bm->hint)
+		bm->hint = bit;
+	spin_unlock_irqrestore(&bm->lock, flags);
+}
 
 struct iommu_dma_msi_cookie {
 	dma_addr_t msi_iova;
@@ -430,6 +638,11 @@ void iommu_put_dma_cookie(struct iommu_domain *domain)
 		iommu_dma_free_fq(cookie);
 		put_iova_domain(&cookie->iovad);
 	}
+	if (cookie->bm_valid) {
+		kfree(cookie->bm.bitmap);
+		cookie->bm_valid = false;
+	}
+	iommu_dma_fast_destroy(&cookie->fast);
 	list_for_each_entry_safe(msi, tmp, &cookie->msi_page_list, list)
 		kfree(msi);
 	kfree(cookie);
@@ -720,6 +933,39 @@ static int iommu_dma_init_domain(struct iommu_domain *domain, struct device *dev
 	     iommu_dma_init_fq(domain)))
 		domain->type = IOMMU_DOMAIN_DMA;
 
+	/* Initialise per-CPU fastmap IOVA allocator (KP5.0 port) */
+	if (!cookie->fast.valid && iommu_fast_mode_enabled) {
+		dma_addr_t fast_base = (dma_addr_t)(base_pfn << order);
+
+		if (IOMMU_FAST_IOVA_SIZE <= (domain->geometry.aperture_end - fast_base))
+			iommu_dma_fast_init(&cookie->fast, fast_base, order);
+	}
+
+	/* Initialise global spinlock bitmap IOVA allocator */
+	if (!cookie->bm_valid) {
+		unsigned long aperture_end = domain->geometry.aperture_end;
+		unsigned long aperture_start = base_pfn << order;
+		unsigned long nbits;
+
+		if (aperture_end > aperture_start) {
+			nbits = (aperture_end - aperture_start + 1) >> order;
+			cookie->bm.bitmap = kzalloc(BITS_TO_LONGS(nbits) *
+						    sizeof(unsigned long),
+						    GFP_KERNEL);
+			if (cookie->bm.bitmap) {
+				cookie->bm.nbits = nbits;
+				cookie->bm.hint  = 0;
+				cookie->bm.base  = (dma_addr_t)aperture_start;
+				cookie->bm.shift = order;
+				spin_lock_init(&cookie->bm.lock);
+				cookie->bm_valid = true;
+				pr_debug("iommu: bitmap IOVA allocator: %lu bits (%lu KB) base=0x%llx\n",
+					 nbits, (nbits >> 3) >> 10,
+					 (unsigned long long)cookie->bm.base);
+			}
+		}
+	}
+
 	return iova_reserve_iommu_regions(dev, domain);
 }
 
@@ -769,6 +1015,25 @@ static dma_addr_t iommu_dma_alloc_iova(struct iommu_domain *domain,
 		return domain->msi_cookie->msi_iova - size;
 	}
 
+
+	/* KP5.0 fastmap: per-CPU bitmap allocator (no spinlock) */
+	if (iommu_fast_mode_enabled && cookie->fast.valid) {
+		dma_addr_t fast_iova = iommu_dma_fast_alloc_iova(&cookie->fast, size);
+		if (fast_iova) {
+			return fast_iova;
+		}
+		/* Fall through to tree if per-CPU slice full */
+	}
+
+	/* Global spinlock bitmap allocator: O(1) for single-granule allocations */
+	if (iommu_bitmap_alloc_enabled && cookie->bm_valid) {
+		dma_addr_t bm_iova = iommu_dma_bitmap_alloc(&cookie->bm, size);
+		if (bm_iova) {
+			return bm_iova;
+		}
+		/* Fall through to tree if bitmap full */
+	}
+
 	shift = iova_shift(iovad);
 	iova_len = size >> shift;
 
@@ -806,18 +1071,31 @@ done:
 static void iommu_dma_free_iova(struct iommu_domain *domain, dma_addr_t iova,
 				size_t size, struct iommu_iotlb_gather *gather)
 {
-	struct iova_domain *iovad = &domain->iova_cookie->iovad;
+	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+	struct iova_domain *iovad = &cookie->iovad;
 
 	/* The MSI case is only ever cleaning up its most recent allocation */
-	if (domain->cookie_type == IOMMU_COOKIE_DMA_MSI)
+	if (domain->cookie_type == IOMMU_COOKIE_DMA_MSI) {
 		domain->msi_cookie->msi_iova -= size;
-	else if (gather && gather->queued)
-		queue_iova(domain->iova_cookie, iova_pfn(iovad, iova),
+	} else if (iommu_fast_mode_enabled && cookie->fast.valid &&
+		   iova >= cookie->fast.base &&
+		   iova < cookie->fast.base + (dma_addr_t)cookie->fast.ncpus *
+					       (cookie->fast.nbits_per_cpu << cookie->fast.shift)) {
+		/* Per-CPU fastmap IOVA: free immediately (atomic clear_bit) */
+		iommu_dma_fast_free_iova(&cookie->fast, iova, size);
+	} else if (iommu_bitmap_alloc_enabled && cookie->bm_valid &&
+		   iova >= cookie->bm.base &&
+		   iova < cookie->bm.base + (cookie->bm.nbits << cookie->bm.shift)) {
+		/* Global bitmap IOVA: free immediately (no queue needed) */
+		iommu_dma_bitmap_free(&cookie->bm, iova, size);
+	} else if (gather && gather->queued) {
+		queue_iova(cookie, iova_pfn(iovad, iova),
 				size >> iova_shift(iovad),
 				&gather->freelist);
-	else
+	} else {
 		free_iova_fast(iovad, iova_pfn(iovad, iova),
 				size >> iova_shift(iovad));
+	}
 }
 
 static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
@@ -864,8 +1142,9 @@ static dma_addr_t __iommu_dma_map(struct device *dev, phys_addr_t phys,
 	size = iova_align(iovad, size + iova_off);
 
 	iova = iommu_dma_alloc_iova(domain, size, dma_mask, dev);
-	if (!iova)
+	if (!iova) {
 		return DMA_MAPPING_ERROR;
+	}
 
 	if (iommu_map(domain, iova, phys - iova_off, size, prot, GFP_ATOMIC)) {
 		iommu_dma_free_iova(domain, iova, size, NULL);
@@ -1224,6 +1503,7 @@ dma_addr_t iommu_dma_map_phys(struct device *dev, phys_addr_t phys, size_t size,
 	struct iova_domain *iovad = &cookie->iovad;
 	dma_addr_t iova, dma_mask = dma_get_mask(dev);
 
+
 	/*
 	 * If both the physical buffer start address and size are page aligned,
 	 * we don't need to use a bounce page.
@@ -1254,6 +1534,7 @@ void iommu_dma_unmap_phys(struct device *dev, dma_addr_t dma_handle,
 		size_t size, enum dma_data_direction dir, unsigned long attrs)
 {
 	phys_addr_t phys;
+
 
 	if (attrs & (DMA_ATTR_MMIO | DMA_ATTR_REQUIRE_COHERENT)) {
 		__iommu_dma_unmap(dev, dma_handle, size);
