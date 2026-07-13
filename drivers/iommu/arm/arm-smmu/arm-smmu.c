@@ -607,16 +607,25 @@ void arm_smmu_write_context_bank(struct arm_smmu_device *smmu, int idx)
 		reg |= FIELD_PREP(ARM_SMMU_CBAR_IRPTNDX, cfg->irptndx);
 
 	/*
-	 * Use the weakest shareability/memory types, so they are
-	 * overridden by the ttbcr/pte.
+	 * For nested S1+S2 translation (TYPE=3), CBAR[15:8] is S2_CBNDX
+	 * (the direct index of the Stage-2 CB) and CBAR[7:0] is the VMID
+	 * of that CB used for TLB tagging.  The S1_BPSHCFG and S1_MEMATTR
+	 * fields occupy the same bits and must NOT be written in this case.
+	 *
+	 * For all other Stage-1 types, use the weakest shareability/memory
+	 * attributes so they are overridden by the ttbcr/pte.
 	 */
-	if (stage1) {
+	if (cfg->cbar == CBAR_TYPE_S1_TRANS_S2_TRANS) {
+		reg |= FIELD_PREP(ARM_SMMU_CBAR_S2_CBNDX, cfg->nested_cbndx);
+		if (!(smmu->features & ARM_SMMU_FEAT_VMID16))
+			reg |= FIELD_PREP(ARM_SMMU_CBAR_VMID, cfg->nested_vmid);
+	} else if (stage1) {
 		reg |= FIELD_PREP(ARM_SMMU_CBAR_S1_BPSHCFG,
 				  ARM_SMMU_CBAR_S1_BPSHCFG_NSH) |
 		       FIELD_PREP(ARM_SMMU_CBAR_S1_MEMATTR,
 				  ARM_SMMU_CBAR_S1_MEMATTR_WB);
 	} else if (!(smmu->features & ARM_SMMU_FEAT_VMID16)) {
-		/* 8-bit VMIDs live in CBAR */
+		/* S2-only: 8-bit VMIDs live in CBAR */
 		reg |= FIELD_PREP(ARM_SMMU_CBAR_VMID, cfg->vmid);
 	}
 	arm_smmu_gr1_write(smmu, ARM_SMMU_GR1_CBAR(idx), reg);
