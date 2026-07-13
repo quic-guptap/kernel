@@ -679,8 +679,12 @@ static struct arm_smmu_device *qcom_smmu_create(struct arm_smmu_device *smmu,
 	if (!impl)
 		return smmu;
 
-	/* Check to make sure qcom_scm has finished probing */
-	if (!qcom_scm_is_available())
+	/*
+	 * Some platforms call qcom_scm_qsmmu500_wait_safe_toggle() in their
+	 * reset function and require SCM to be available before probing.
+	 * Only defer probe when the platform data explicitly requests it.
+	 */
+	if (data && data->needs_scm && !qcom_scm_is_available())
 		return ERR_PTR(dev_err_probe(smmu->dev, -EPROBE_DEFER,
 			"qcom_scm not ready\n"));
 
@@ -721,6 +725,7 @@ static const struct qcom_smmu_match_data qcom_smmu_v2_data = {
 
 static const struct qcom_smmu_match_data sdm845_smmu_500_data = {
 	.impl = &sdm845_smmu_500_impl,
+	.needs_scm = true,
 	/*
 	 * No need for adreno impl here. On sdm845 the Adreno SMMU is handled
 	 * by the separate sdm845-smmu-v2 device.
