@@ -22,6 +22,7 @@
 #include <linux/module.h>
 #include <linux/pgtable.h>
 #include <linux/scatterlist.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
@@ -55,14 +56,28 @@ struct dma_heap_attachment {
 #define HIGH_ORDER_GFP  (((GFP_HIGHUSER | __GFP_ZERO | __GFP_NOWARN \
 				| __GFP_NORETRY) & ~__GFP_RECLAIM) \
 				| __GFP_COMP)
-static gfp_t order_flags[] = {HIGH_ORDER_GFP, HIGH_ORDER_GFP, LOW_ORDER_GFP};
 /*
- * The selection of the orders used for allocation (1MB, 64K, 4K) is designed
- * to match with the sizes often found in IOMMUs. Using order 4 pages instead
- * of order 0 pages can significantly improve the performance of many IOMMUs
- * by reducing TLB pressure and time spent updating page tables.
+ * Allocation orders correspond to the ARM64 PMD block and CONT PTE
+ * hugepage sizes for each CPU page granule, which also align with the
+ * TLB entry sizes of a 4K-granule IOMMU (arm-smmu, arm-smmu-v3).
+ * Each order = (level_shift - PAGE_SHIFT), derived from:
+ *   PMD_SHIFT      = (PAGE_SHIFT - 3) * 2 + 3
+ *   CONT_PTE_SHIFT = CONFIG_ARM64_CONT_PTE_SHIFT + PAGE_SHIFT
+ *
+ * 4K  CPU (PAGE_SHIFT=12): PMD=2MiB   (21-12=9),  CONT_PTE=64KiB  (16-12=4)
+ * 16K CPU (PAGE_SHIFT=14): PMD=32MiB  (25-14=11), CONT_PTE=2MiB   (21-14=7)
+ * 64K CPU (PAGE_SHIFT=16): PMD=512MiB (29-16=13), CONT_PTE=2MiB   (21-16=5)
  */
-static const unsigned int orders[] = {8, 4, 0};
+#if (PAGE_SIZE == SZ_4K)
+static gfp_t order_flags[] = {HIGH_ORDER_GFP, HIGH_ORDER_GFP, LOW_ORDER_GFP};
+static const unsigned int orders[] = {21 - PAGE_SHIFT, 16 - PAGE_SHIFT, 0};
+#elif (PAGE_SIZE == SZ_16K)
+static gfp_t order_flags[] = {HIGH_ORDER_GFP, HIGH_ORDER_GFP, LOW_ORDER_GFP};
+static const unsigned int orders[] = {25 - PAGE_SHIFT, 21 - PAGE_SHIFT, 0};
+#else /* SZ_64K */
+static gfp_t order_flags[] = {HIGH_ORDER_GFP, HIGH_ORDER_GFP, LOW_ORDER_GFP};
+static const unsigned int orders[] = {29 - PAGE_SHIFT, 21 - PAGE_SHIFT, 0};
+#endif
 #define NUM_ORDERS ARRAY_SIZE(orders)
 
 static int system_heap_set_page_decrypted(struct page *page)
