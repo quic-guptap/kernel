@@ -1270,12 +1270,24 @@ static int arm_smmu_map_pages(struct iommu_domain *domain, unsigned long iova,
 			      phys_addr_t paddr, size_t pgsize, size_t pgcount,
 			      int prot, gfp_t gfp, size_t *mapped)
 {
-	struct io_pgtable_ops *ops = to_smmu_domain(domain)->pgtbl_ops;
-	struct arm_smmu_device *smmu = to_smmu_domain(domain)->smmu;
+	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+	struct io_pgtable_ops *ops = smmu_domain->pgtbl_ops;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
 	int ret;
 
 	if (!ops)
 		return -ENODEV;
+
+	/*
+	 * Allow implementations to suppress protection attributes that
+	 * are unsafe on their interconnect before the flags reach
+	 * io-pgtable. Only strip when the SMMU itself is non-coherent;
+	 * coherent instances (ARM_SMMU_FEAT_COHERENT_WALK set) must keep
+	 * IOMMU_CACHE so that io-pgtable selects the correct WB+IS PTEs.
+	 */
+	if (smmu->impl && smmu->impl->prot_mask &&
+	    !(smmu->features & ARM_SMMU_FEAT_COHERENT_WALK))
+		prot &= ~smmu->impl->prot_mask;
 
 	arm_smmu_rpm_get(smmu);
 	ret = ops->map_pages(ops, iova, paddr, pgsize, pgcount, prot, gfp, mapped);
@@ -1400,9 +1412,12 @@ static phys_addr_t arm_smmu_iova_to_phys(struct iommu_domain *domain,
 	return ops->iova_to_phys(ops, iova);
 }
 
-static bool arm_smmu_capable(struct device *dev, enum iommu_cap cap)
+bool arm_smmu_capable(struct device *dev, enum iommu_cap cap)
 {
 	struct arm_smmu_master_cfg *cfg = dev_iommu_priv_get(dev);
+
+	if (cfg->smmu->impl && cfg->smmu->impl->capable)
+		return cfg->smmu->impl->capable(dev, cap);
 
 	switch (cap) {
 	case IOMMU_CAP_CACHE_COHERENCY:
