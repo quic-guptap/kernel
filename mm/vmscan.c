@@ -4811,6 +4811,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	int scanned, reclaimed;
 	int isolated = 0, type, type_scanned;
 	bool skip_retry = false;
+	bool need_drain = false;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
@@ -4831,6 +4832,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	if (list_empty(&list))
 		return scanned;
 retry:
+	need_drain = false;
 	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false, memcg);
 	sc->nr_reclaimed += reclaimed;
 	/* Retry pass is only meant for clean folios without new isolation */
@@ -4844,8 +4846,12 @@ retry:
 		DEFINE_MIN_SEQ(lruvec);
 
 		if (!folio_evictable(folio)) {
+			bool may_cache = folio_may_be_lru_cached(folio);
+
 			list_del(&folio->lru);
 			folio_putback_lru(folio);
+			if (may_cache)
+				need_drain = true;
 			continue;
 		}
 
@@ -4860,6 +4866,18 @@ retry:
 		if (lru_gen_folio_seq(lruvec, folio, false) == min_seq[type])
 			set_mask_bits(&folio->flags.f, LRU_REFS_FLAGS, BIT(PG_active));
 	}
+
+	/*
+	 * Flush all per-CPU LRU add batches before move_folios_to_lru().
+	 * folio_putback_lru() defers list insertion into a per-CPU batch
+	 * for small folios; if that batch is on a different CPU than the
+	 * one now running move_folios_to_lru(), the LRU list can be
+	 * corrupted when the batch eventually flushes. Large folios bypass
+	 * the per-CPU cache and are never left pending, so only small
+	 * folios require the drain. lru_add_drain_all() covers all CPUs.
+	 */
+	if (need_drain)
+		lru_add_drain_all();
 
 	move_folios_to_lru(&list);
 
