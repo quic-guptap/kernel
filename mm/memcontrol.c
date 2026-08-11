@@ -981,7 +981,7 @@ void lruvec_stat_mod_folio(struct folio *folio, enum node_stat_item idx,
 	struct lruvec *lruvec;
 
 	rcu_read_lock();
-	memcg = folio_memcg(folio);
+	memcg = folio_memcg_check(folio);
 	/* Untracked pages have no memcg, no lruvec. Update only the node */
 	if (!memcg) {
 		rcu_read_unlock();
